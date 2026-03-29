@@ -6,7 +6,24 @@ const { Pool } = require('pg');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN }));
+// Support multiple allowed origins (comma-separated in env var)
+const allowedOrigins = (process.env.ALLOWED_ORIGIN || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (e.g. curl, Render health checks)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS: ' + origin));
+    }
+  }
+}));
+
 app.use(express.json());
 
 const pool = new Pool({
