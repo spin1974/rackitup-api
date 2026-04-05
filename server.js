@@ -411,6 +411,41 @@ app.put('/admin/poolhalls/:id', requireAuth, requireSiteAdmin, async (req, res) 
   }
 });
 
+// ── GET /admin/poolhalls/:id ──────────────────────────────────────────────────
+app.get('/admin/poolhalls/:id', requireAuth, requireSiteAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT * FROM poolhall WHERE poolhall_id = $1`,
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Pool hall not found' });
+    res.json({ poolhall: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /admin/poolhalls/:id/users ────────────────────────────────────────────
+app.get('/admin/poolhalls/:id/users', requireAuth, requireSiteAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT u.user_id, u.user_name, u.user_email,
+              u.role_id, r.role_name,
+              u.locked_at, u.deleted_at, u.created_at
+       FROM users u
+       JOIN role r ON u.role_id = r.role_id
+       WHERE u.poolhall_id = $1
+       ORDER BY u.created_at ASC`,
+      [id]
+    );
+    res.json({ users: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Rack It Up API running on port ${PORT}`);
 });
