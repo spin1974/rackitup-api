@@ -361,8 +361,8 @@ app.get('/admin/poolhalls', requireAuth, requireSiteAdmin, async (req, res) => {
 app.post('/admin/poolhalls', requireAuth, requireSiteAdmin, async (req, res) => {
   const { poolhall_name, address_line1, address_line2, city, province_state,
           postal_code, country, phone_number, primary_email, website } = req.body;
-  if (!poolhall_name) {
-    return res.status(400).json({ error: 'poolhall_name is required' });
+  if (!poolhall_name || !phone_number || !primary_email) {
+    return res.status(400).json({ error: 'poolhall_name, phone_number and primary_email are required' });
   }
   try {
     const result = await pool.query(
