@@ -106,8 +106,8 @@ app.post('/auth/register', async (req, res) => {
   try {
     const hash   = await bcrypt.hash(user_password, 10);
     const result = await pool.query(
-      `INSERT INTO users (user_name, user_password, user_email, poolhall_id, role_id)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO users (user_name, user_password, user_email, poolhall_id, role_id, password_changed_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
        RETURNING user_id, user_name, user_email, poolhall_id, role_id, created_at`,
       [user_name, hash, user_email, poolhall_id || 1, role_id]
     );
@@ -180,9 +180,9 @@ app.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: GENERIC });
     }
 
-    // Success — reset lockout state
+    // Success — reset lockout state and record login time
     await pool.query(
-      `UPDATE users SET failed_attempts = 0, locked_at = NULL, updated_at = NOW() WHERE user_id = $1`,
+      `UPDATE users SET failed_attempts = 0, locked_at = NULL, last_login_at = NOW(), updated_at = NOW() WHERE user_id = $1`,
       [user.user_id]
     );
 
@@ -246,7 +246,9 @@ app.get('/admin/users', requireAuth, requireSiteAdmin, async (req, res) => {
     const result = await pool.query(`
       SELECT u.user_id, u.user_name, u.user_email, u.poolhall_id,
              u.role_id, r.role_name, p.poolhall_name,
+             u.phone_number, u.display_name,
              u.failed_attempts, u.locked_at, u.deleted_at,
+             u.last_login_at, u.password_changed_at,
              u.created_at, u.updated_at
       FROM users u
       JOIN role     r ON u.role_id     = r.role_id
@@ -261,17 +263,21 @@ app.get('/admin/users', requireAuth, requireSiteAdmin, async (req, res) => {
 
 // ── POST /admin/users ─────────────────────────────────────────────────────────
 app.post('/admin/users', requireAuth, requireSiteAdmin, async (req, res) => {
-  const { user_name, user_password, user_email, poolhall_id, role_id } = req.body;
+  const { user_name, user_password, user_email, poolhall_id, role_id,
+          phone_number, display_name } = req.body;
   if (!user_name || !user_password || !user_email || !role_id) {
     return res.status(400).json({ error: 'user_name, user_password, user_email and role_id are required' });
   }
   try {
     const hash   = await bcrypt.hash(user_password, 10);
     const result = await pool.query(
-      `INSERT INTO users (user_name, user_password, user_email, poolhall_id, role_id)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING user_id, user_name, user_email, poolhall_id, role_id, created_at`,
-      [user_name, hash, user_email, poolhall_id || 1, role_id]
+      `INSERT INTO users (user_name, user_password, user_email, poolhall_id, role_id,
+                          phone_number, display_name, password_changed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       RETURNING user_id, user_name, user_email, poolhall_id, role_id,
+                 phone_number, display_name, created_at`,
+      [user_name, hash, user_email, poolhall_id || 1, role_id,
+       phone_number || null, display_name || null]
     );
     res.status(201).json({ user: result.rows[0] });
   } catch (err) {
@@ -283,17 +289,20 @@ app.post('/admin/users', requireAuth, requireSiteAdmin, async (req, res) => {
 // ── PUT /admin/users/:id ──────────────────────────────────────────────────────
 app.put('/admin/users/:id', requireAuth, requireSiteAdmin, async (req, res) => {
   const { id } = req.params;
-  const { user_email, poolhall_id, role_id } = req.body;
+  const { user_email, poolhall_id, role_id, phone_number, display_name } = req.body;
   try {
     const result = await pool.query(
       `UPDATE users
-       SET user_email   = COALESCE($1, user_email),
-           poolhall_id  = COALESCE($2, poolhall_id),
-           role_id      = COALESCE($3, role_id),
-           updated_at   = NOW()
-       WHERE user_id = $4
-       RETURNING user_id, user_name, user_email, poolhall_id, role_id, updated_at`,
-      [user_email, poolhall_id, role_id, id]
+       SET user_email    = COALESCE($1, user_email),
+           poolhall_id   = COALESCE($2, poolhall_id),
+           role_id       = COALESCE($3, role_id),
+           phone_number  = COALESCE($4, phone_number),
+           display_name  = COALESCE($5, display_name),
+           updated_at    = NOW()
+       WHERE user_id = $6
+       RETURNING user_id, user_name, user_email, poolhall_id, role_id,
+                 phone_number, display_name, updated_at`,
+      [user_email, poolhall_id, role_id, phone_number, display_name, id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
     res.json({ user: result.rows[0] });
