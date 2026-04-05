@@ -1,15 +1,20 @@
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
+const cors    = require('cors');
 const { Pool } = require('pg');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
+const bcrypt  = require('bcrypt');
+const jwt     = require('jsonwebtoken');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const app        = express();
+const PORT       = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// Support multiple allowed origins (comma-separated in env var)
+const LOCKOUT_ATTEMPTS  = 3;       // Failed attempts before lockout
+const LOCKOUT_MINUTES   = 30;      // Auto-unlock after this many minutes
+const RATE_LIMIT_MAX    = 10;      // Max login attempts per window per IP
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minute window in ms
+
+// ── CORS ──────────────────────────────────────────────────────────────────────
 const allowedOrigins = (process.env.ALLOWED_ORIGIN || '')
   .split(',')
   .map(o => o.trim())
@@ -28,15 +33,47 @@ app.use(cors({
 
 app.use(express.json());
 
+// ── Database pool ─────────────────────────────────────────────────────────────
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
+// ── In-memory rate limiter (per IP) ──────────────────────────────────────────
+// Tracks login attempts per IP address — resets after RATE_LIMIT_WINDOW
+const rateLimitStore = new Map();
+
+function checkRateLimit(ip) {
+  const now    = Date.now();
+  const record = rateLimitStore.get(ip);
+
+  if (!record || now - record.windowStart > RATE_LIMIT_WINDOW) {
+    rateLimitStore.set(ip, { count: 1, windowStart: now });
+    return true; // allowed
+  }
+
+  if (record.count >= RATE_LIMIT_MAX) {
+    return false; // blocked
+  }
+
+  record.count++;
+  return true; // allowed
+}
+
+// Clean up old rate limit entries every 15 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of rateLimitStore.entries()) {
+    if (now - record.windowStart > RATE_LIMIT_WINDOW) {
+      rateLimitStore.delete(ip);
+    }
+  }
+}, RATE_LIMIT_WINDOW);
+
 // ── Middleware: verify JWT token ──────────────────────────────────────────────
 function requireAuth(req, res, next) {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // Bearer <token>
+  const token = authHeader && authHeader.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
@@ -63,8 +100,6 @@ app.get('/db-test', async (req, res) => {
 });
 
 // ── AUTH: Register new user ───────────────────────────────────────────────────
-// POST /auth/register
-// Body: { user_name, user_password, user_email, poolhall_id, role_id }
 app.post('/auth/register', async (req, res) => {
   const { user_name, user_password, user_email, poolhall_id, role_id } = req.body;
 
@@ -73,7 +108,7 @@ app.post('/auth/register', async (req, res) => {
   }
 
   try {
-    const hash = await bcrypt.hash(user_password, 10);
+    const hash   = await bcrypt.hash(user_password, 10);
     const result = await pool.query(
       `INSERT INTO users (user_name, user_password, user_email, poolhall_id, role_id)
        VALUES ($1, $2, $3, $4, $5)
@@ -90,35 +125,89 @@ app.post('/auth/register', async (req, res) => {
 });
 
 // ── AUTH: Login ───────────────────────────────────────────────────────────────
-// POST /auth/login
-// Body: { user_name, user_password }
 app.post('/auth/login', async (req, res) => {
+  const ip       = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  const GENERIC  = 'Invalid username or password';
+
+  // Rate limit check
+  if (!checkRateLimit(ip)) {
+    return res.status(429).json({ error: GENERIC });
+  }
+
   const { user_name, user_password } = req.body;
 
   if (!user_name || !user_password) {
-    return res.status(400).json({ error: 'user_name and user_password are required' });
+    return res.status(400).json({ error: GENERIC });
   }
 
   try {
     const result = await pool.query(
       `SELECT u.user_id, u.user_name, u.user_email, u.user_password,
-              u.poolhall_id, u.role_id, r.role_name
+              u.poolhall_id, u.role_id, r.role_name,
+              u.failed_attempts, u.locked_at
        FROM users u
        JOIN role r ON u.role_id = r.role_id
        WHERE u.user_name = $1`,
       [user_name]
     );
 
+    // User not found — return generic error
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid username or password' });
+      return res.status(401).json({ error: GENERIC });
     }
 
     const user = result.rows[0];
+    const now  = new Date();
+
+    // Check lockout status
+    if (user.locked_at) {
+      const lockedAt      = new Date(user.locked_at);
+      const minutesElapsed = (now - lockedAt) / 1000 / 60;
+
+      if (minutesElapsed < LOCKOUT_MINUTES) {
+        // Still locked — return generic error, never reveal lockout
+        return res.status(401).json({ error: GENERIC });
+      } else {
+        // Auto-unlock silently — reset lockout state before proceeding
+        await pool.query(
+          `UPDATE users SET locked_at = NULL, failed_attempts = 0, updated_at = NOW()
+           WHERE user_id = $1`,
+          [user.user_id]
+        );
+        user.locked_at       = null;
+        user.failed_attempts = 0;
+      }
+    }
+
+    // Check password
     const match = await bcrypt.compare(user_password, user.user_password);
 
     if (!match) {
-      return res.status(401).json({ error: 'Invalid username or password' });
+      const newAttempts = user.failed_attempts + 1;
+      if (newAttempts >= LOCKOUT_ATTEMPTS) {
+        // Lock the account
+        await pool.query(
+          `UPDATE users SET failed_attempts = $1, locked_at = NOW(), updated_at = NOW()
+           WHERE user_id = $2`,
+          [newAttempts, user.user_id]
+        );
+      } else {
+        // Increment counter
+        await pool.query(
+          `UPDATE users SET failed_attempts = $1, updated_at = NOW()
+           WHERE user_id = $2`,
+          [newAttempts, user.user_id]
+        );
+      }
+      return res.status(401).json({ error: GENERIC });
     }
+
+    // Successful login — reset failed attempts and issue token
+    await pool.query(
+      `UPDATE users SET failed_attempts = 0, locked_at = NULL, updated_at = NOW()
+       WHERE user_id = $1`,
+      [user.user_id]
+    );
 
     const token = jwt.sign(
       {
@@ -144,13 +233,13 @@ app.post('/auth/login', async (req, res) => {
         role_name:   user.role_name
       }
     });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ── AUTH: Verify token / get current user ─────────────────────────────────────
-// GET /auth/me  (requires Authorization: Bearer <token>)
 app.get('/auth/me', requireAuth, (req, res) => {
   res.json({ user: req.user });
 });
