@@ -82,6 +82,26 @@ function requireSiteAdmin(req, res, next) {
   next();
 }
 
+// ── Middleware: require hall_admin or hall_viewer role ────────────────────────
+// Injects req.hallId from JWT — all hall routes are automatically scoped.
+function requireHallAuth(req, res, next) {
+  const role = req.user.role_name;
+  if (role !== 'hall_admin' && role !== 'hall_viewer') {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+  req.hallId = req.user.poolhall_id;
+  next();
+}
+
+// ── Middleware: require hall_admin role (write operations) ────────────────────
+function requireHallAdmin(req, res, next) {
+  if (req.user.role_name !== 'hall_admin') {
+    return res.status(403).json({ error: 'Access denied — hall_admin role required' });
+  }
+  req.hallId = req.user.poolhall_id;
+  next();
+}
+
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -144,16 +164,13 @@ app.post('/auth/login', async (req, res) => {
     const user = result.rows[0];
     const now  = new Date();
 
-    // Soft-deleted users cannot log in
     if (user.deleted_at) return res.status(401).json({ error: GENERIC });
 
-    // Lockout check
     if (user.locked_at) {
       const minutesElapsed = (now - new Date(user.locked_at)) / 1000 / 60;
       if (minutesElapsed < LOCKOUT_MINUTES) {
         return res.status(401).json({ error: GENERIC });
       }
-      // Auto-unlock silently
       await pool.query(
         `UPDATE users SET locked_at = NULL, failed_attempts = 0, updated_at = NOW() WHERE user_id = $1`,
         [user.user_id]
@@ -162,7 +179,6 @@ app.post('/auth/login', async (req, res) => {
       user.failed_attempts = 0;
     }
 
-    // Password check
     const match = await bcrypt.compare(user_password, user.user_password);
     if (!match) {
       const newAttempts = user.failed_attempts + 1;
@@ -180,7 +196,6 @@ app.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: GENERIC });
     }
 
-    // Success — reset lockout state and record login time
     await pool.query(
       `UPDATE users SET failed_attempts = 0, locked_at = NULL, last_login_at = NOW(), updated_at = NOW() WHERE user_id = $1`,
       [user.user_id]
@@ -232,7 +247,7 @@ app.get('/admin/stats', requireAuth, requireSiteAdmin, async (req, res) => {
       SELECT
         (SELECT COUNT(*) FROM users    WHERE deleted_at IS NULL) AS user_count,
         (SELECT COUNT(*) FROM poolhall WHERE poolhall_id > 1)    AS poolhall_count,
-        (SELECT COUNT(*) FROM player)                            AS player_count
+        (SELECT COUNT(*) FROM player   WHERE deleted_at IS NULL) AS player_count
     `);
     res.json(result.rows[0]);
   } catch (err) {
@@ -332,7 +347,6 @@ app.put('/admin/users/:id/unlock', requireAuth, requireSiteAdmin, async (req, re
 // ── DELETE /admin/users/:id (soft delete) ─────────────────────────────────────
 app.delete('/admin/users/:id', requireAuth, requireSiteAdmin, async (req, res) => {
   const { id } = req.params;
-  // Prevent deleting your own account
   if (parseInt(id) === req.user.user_id) {
     return res.status(400).json({ error: 'You cannot delete your own account' });
   }
@@ -455,6 +469,262 @@ app.get('/admin/poolhalls/:id/users', requireAuth, requireSiteAdmin, async (req,
   }
 });
 
+// ── GET /admin/poolhalls/:id/settings ─────────────────────────────────────────
+app.get('/admin/poolhalls/:id/settings', requireAuth, requireSiteAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT setting_name, setting_value, updated_at
+       FROM poolhall_settings
+       WHERE poolhall_id = $1
+       ORDER BY setting_name`,
+      [id]
+    );
+    // Return as flat key→value object for convenience
+    const settings = {};
+    result.rows.forEach(r => { settings[r.setting_name] = r.setting_value; });
+    res.json({ settings });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /admin/poolhalls/:id/settings ─────────────────────────────────────────
+// Body: { settings: { key: value, ... } }
+app.put('/admin/poolhalls/:id/settings', requireAuth, requireSiteAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { settings } = req.body;
+  if (!settings || typeof settings !== 'object') {
+    return res.status(400).json({ error: 'settings object required' });
+  }
+  try {
+    const entries = Object.entries(settings);
+    for (const [name, value] of entries) {
+      await pool.query(
+        `INSERT INTO poolhall_settings (poolhall_id, setting_name, setting_value, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (poolhall_id, setting_name)
+         DO UPDATE SET setting_value = $3, updated_at = NOW()`,
+        [id, name, value === null || value === undefined ? '' : String(value)]
+      );
+    }
+    res.json({ message: `${entries.length} setting(s) saved` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HALL ADMIN ENDPOINTS — require auth + hall_admin or hall_viewer role
+// All routes are automatically scoped to req.hallId from JWT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── GET /hall/profile ─────────────────────────────────────────────────────────
+app.get('/hall/profile', requireAuth, requireHallAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM poolhall WHERE poolhall_id = $1`,
+      [req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Pool hall not found' });
+    res.json({ poolhall: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/profile ─────────────────────────────────────────────────────────
+app.put('/hall/profile', requireAuth, requireHallAdmin, async (req, res) => {
+  const { poolhall_name, address_line1, address_line2, city, province_state,
+          postal_code, country, phone_number, primary_email, website } = req.body;
+  try {
+    const result = await pool.query(
+      `UPDATE poolhall
+       SET poolhall_name  = COALESCE($1,  poolhall_name),
+           address_line1  = COALESCE($2,  address_line1),
+           address_line2  = COALESCE($3,  address_line2),
+           city           = COALESCE($4,  city),
+           province_state = COALESCE($5,  province_state),
+           postal_code    = COALESCE($6,  postal_code),
+           country        = COALESCE($7,  country),
+           phone_number   = COALESCE($8,  phone_number),
+           primary_email  = COALESCE($9,  primary_email),
+           website        = COALESCE($10, website),
+           updated_at     = NOW()
+       WHERE poolhall_id = $11
+       RETURNING *`,
+      [poolhall_name, address_line1, address_line2, city, province_state,
+       postal_code, country, phone_number, primary_email, website, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Pool hall not found' });
+    res.json({ poolhall: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/settings ────────────────────────────────────────────────────────
+app.get('/hall/settings', requireAuth, requireHallAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT setting_name, setting_value
+       FROM poolhall_settings
+       WHERE poolhall_id = $1
+       ORDER BY setting_name`,
+      [req.hallId]
+    );
+    const settings = {};
+    result.rows.forEach(r => { settings[r.setting_name] = r.setting_value; });
+    res.json({ settings });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/settings ────────────────────────────────────────────────────────
+// Body: { settings: { key: value, ... } }
+app.put('/hall/settings', requireAuth, requireHallAdmin, async (req, res) => {
+  const { settings } = req.body;
+  if (!settings || typeof settings !== 'object') {
+    return res.status(400).json({ error: 'settings object required' });
+  }
+  try {
+    const entries = Object.entries(settings);
+    for (const [name, value] of entries) {
+      await pool.query(
+        `INSERT INTO poolhall_settings (poolhall_id, setting_name, setting_value, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (poolhall_id, setting_name)
+         DO UPDATE SET setting_value = $3, updated_at = NOW()`,
+        [req.hallId, name, value === null || value === undefined ? '' : String(value)]
+      );
+    }
+    res.json({ message: `${entries.length} setting(s) saved` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/stats ───────────────────────────────────────────────────────────
+app.get('/hall/stats', requireAuth, requireHallAuth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        (SELECT COUNT(*) FROM player WHERE poolhall_id = $1 AND deleted_at IS NULL) AS player_count
+    `, [req.hallId]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/players ─────────────────────────────────────────────────────────
+app.get('/hall/players', requireAuth, requireHallAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT player_id, first_name, last_name, home_town, cell_number,
+              email_address, fargo_id, fargo_rating, hall_rating, tier,
+              created_at, updated_at
+       FROM player
+       WHERE poolhall_id = $1 AND deleted_at IS NULL
+       ORDER BY last_name ASC, first_name ASC`,
+      [req.hallId]
+    );
+    res.json({ players: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/players ────────────────────────────────────────────────────────
+app.post('/hall/players', requireAuth, requireHallAdmin, async (req, res) => {
+  const { first_name, last_name, home_town, cell_number, email_address,
+          fargo_id, fargo_rating, hall_rating, tier } = req.body;
+  if (!first_name || !last_name) {
+    return res.status(400).json({ error: 'first_name and last_name are required' });
+  }
+  if (tier && !['A','B','C','D'].includes(tier)) {
+    return res.status(400).json({ error: 'tier must be A, B, C, or D' });
+  }
+  try {
+    const result = await pool.query(
+      `INSERT INTO player
+         (poolhall_id, first_name, last_name, home_town, cell_number,
+          email_address, fargo_id, fargo_rating, hall_rating, tier)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING *`,
+      [req.hallId, first_name, last_name,
+       home_town || null, cell_number || null, email_address || null,
+       fargo_id || null,
+       fargo_rating || null, hall_rating || null,
+       tier || null]
+    );
+    res.status(201).json({ player: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/players/:id ─────────────────────────────────────────────────────
+app.put('/hall/players/:id', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { first_name, last_name, home_town, cell_number, email_address,
+          fargo_id, fargo_rating, hall_rating, tier } = req.body;
+  if (tier && !['A','B','C','D'].includes(tier)) {
+    return res.status(400).json({ error: 'tier must be A, B, C, or D' });
+  }
+  try {
+    // Scope check: ensure player belongs to this hall
+    const result = await pool.query(
+      `UPDATE player
+       SET first_name    = COALESCE($1,  first_name),
+           last_name     = COALESCE($2,  last_name),
+           home_town     = COALESCE($3,  home_town),
+           cell_number   = COALESCE($4,  cell_number),
+           email_address = COALESCE($5,  email_address),
+           fargo_id      = COALESCE($6,  fargo_id),
+           fargo_rating  = COALESCE($7,  fargo_rating),
+           hall_rating   = COALESCE($8,  hall_rating),
+           tier          = COALESCE($9,  tier),
+           updated_at    = NOW()
+       WHERE player_id = $10 AND poolhall_id = $11 AND deleted_at IS NULL
+       RETURNING *`,
+      [first_name, last_name, home_town, cell_number, email_address,
+       fargo_id, fargo_rating || null, hall_rating || null, tier,
+       id, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+    res.json({ player: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /hall/players/:id (soft delete) ────────────────────────────────────
+app.delete('/hall/players/:id', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `UPDATE player
+       SET deleted_at = NOW(), updated_at = NOW()
+       WHERE player_id = $1 AND poolhall_id = $2 AND deleted_at IS NULL
+       RETURNING player_id, first_name, last_name`,
+      [id, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+    res.json({ message: 'Player deleted', player: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/tournaments ─────────────────────────────────────────────────────
+// Stub — returns empty list until tournament persistence is built
+app.get('/hall/tournaments', requireAuth, requireHallAuth, async (req, res) => {
+  res.json({ tournaments: [] });
+});
+
+// ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Rack It Up API running on port ${PORT}`);
 });
