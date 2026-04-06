@@ -344,6 +344,32 @@ app.put('/admin/users/:id/unlock', requireAuth, requireSiteAdmin, async (req, re
   }
 });
 
+// ── PUT /admin/users/:id/password ────────────────────────────────────────────
+app.put('/admin/users/:id/password', requireAuth, requireSiteAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { new_password } = req.body;
+  if (!new_password || new_password.length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+  }
+  try {
+    const hash   = await bcrypt.hash(new_password, 12);
+    const result = await pool.query(
+      `UPDATE users
+       SET user_password       = $1,
+           password_changed_at = NOW(),
+           updated_at          = NOW()
+       WHERE user_id = $2 AND deleted_at IS NULL
+       RETURNING user_id, user_name`,
+      [hash, id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
+    res.json({ message: 'Password updated.', user: result.rows[0] });
+  } catch (err) {
+    console.error('Password reset error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── DELETE /admin/users/:id (soft delete) ─────────────────────────────────────
 app.delete('/admin/users/:id', requireAuth, requireSiteAdmin, async (req, res) => {
   const { id } = req.params;
