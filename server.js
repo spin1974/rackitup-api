@@ -236,6 +236,44 @@ app.get('/auth/me', requireAuth, (req, res) => {
   res.json({ user: req.user });
 });
 
+// ── AUTH: Change own password ─────────────────────────────────────────────────
+// Requires current password — for logged-in users changing their own password.
+// Different from /admin/users/:id/password which bypasses current-password check.
+app.put('/auth/change-password', requireAuth, async (req, res) => {
+  const { current_password, new_password } = req.body;
+  if (!current_password || !new_password) {
+    return res.status(400).json({ error: 'current_password and new_password are required.' });
+  }
+  if (new_password.length < 8) {
+    return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT user_id, user_password FROM users
+       WHERE user_id = $1 AND deleted_at IS NULL`,
+      [req.user.user_id]
+    );
+    if (!result.rows.length) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    const match = await bcrypt.compare(current_password, result.rows[0].user_password);
+    if (!match) {
+      return res.status(401).json({ error: 'Current password is incorrect.' });
+    }
+    const hash = await bcrypt.hash(new_password, 12);
+    await pool.query(
+      `UPDATE users
+       SET user_password = $1, password_changed_at = NOW(), updated_at = NOW()
+       WHERE user_id = $2`,
+      [hash, req.user.user_id]
+    );
+    res.json({ message: 'Password updated.' });
+  } catch (err) {
+    console.error('Change password error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // SITE ADMIN ENDPOINTS — require auth + site_admin role
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -340,32 +378,6 @@ app.put('/admin/users/:id/unlock', requireAuth, requireSiteAdmin, async (req, re
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
     res.json({ message: 'User unlocked', user: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── PUT /admin/users/:id/password ────────────────────────────────────────────
-app.put('/admin/users/:id/password', requireAuth, requireSiteAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { new_password } = req.body;
-  if (!new_password || new_password.length < 8) {
-    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
-  }
-  try {
-    const hash   = await bcrypt.hash(new_password, 12);
-    const result = await pool.query(
-      `UPDATE users
-       SET user_password       = $1,
-           password_changed_at = NOW(),
-           updated_at          = NOW()
-       WHERE user_id = $2 AND deleted_at IS NULL
-       RETURNING user_id, user_name`,
-      [hash, id]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found.' });
-    res.json({ message: 'Password updated.', user: result.rows[0] });
-  } catch (err) {
-    console.error('Password reset error:', err);
     res.status(500).json({ error: err.message });
   }
 });
