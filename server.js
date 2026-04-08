@@ -429,8 +429,8 @@ app.post('/admin/poolhalls', requireAuth, requireSiteAdmin, async (req, res) => 
     const result = await pool.query(
       `INSERT INTO poolhall
          (poolhall_name, address_line1, address_line2, city, province_state,
-          postal_code, country, phone_number, primary_email, website)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+          postal_code, country, phone_number, primary_email, website, public_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, LEFT(MD5(RANDOM()::TEXT), 12))
        RETURNING *`,
       [poolhall_name, address_line1, address_line2, city, province_state,
        postal_code, country || 'Canada', phone_number, primary_email, website]
@@ -760,6 +760,118 @@ app.delete('/hall/players/:id', requireAuth, requireHallAdmin, async (req, res) 
 // Stub — returns empty list until tournament persistence is built
 app.get('/hall/tournaments', requireAuth, requireHallAuth, async (req, res) => {
   res.json({ tournaments: [] });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHIP TOURNAMENT ENDPOINTS — require auth + hall role
+// All routes automatically scoped to req.hallId from JWT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── GET /hall/chip-tournaments ────────────────────────────────────────────────
+// Returns all tournaments for this hall (all statuses), newest first
+app.get('/hall/chip-tournaments', requireAuth, requireHallAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT tournament_id, poolhall_id, name, status,
+              config, fargo_config,
+              created_at, started_at, finished_at
+       FROM chip_tournaments
+       WHERE poolhall_id = $1
+       ORDER BY created_at DESC`,
+      [req.hallId]
+    );
+    res.json({ tournaments: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/chip-tournaments ───────────────────────────────────────────────
+// Body: { name, config, fargo_config }
+// name is optional — defaults to date + sequence if omitted (applied client-side)
+// config and fargo_config are full JSONB objects
+app.post('/hall/chip-tournaments', requireAuth, requireHallAdmin, async (req, res) => {
+  const { name, config, fargo_config } = req.body;
+  if (!config || typeof config !== 'object') {
+    return res.status(400).json({ error: 'config object is required' });
+  }
+  try {
+    const result = await pool.query(
+      `INSERT INTO chip_tournaments
+         (poolhall_id, name, status, config, fargo_config, created_at)
+       VALUES ($1, $2, 'setup', $3, $4, NOW())
+       RETURNING tournament_id, poolhall_id, name, status,
+                 config, fargo_config, created_at`,
+      [req.hallId,
+       name || null,
+       JSON.stringify(config),
+       fargo_config ? JSON.stringify(fargo_config) : null]
+    );
+    res.status(201).json({ tournament: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/chip-tournaments/:id ────────────────────────────────────────────
+// Updates name, status, config, fargo_config, and lifecycle timestamps.
+// Sets started_at when status transitions to 'running' (if not already set).
+// Sets finished_at when status transitions to 'finished' (if not already set).
+app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { name, status, config, fargo_config } = req.body;
+
+  const validStatuses = ['setup', 'running', 'finished'];
+  if (status && !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+  }
+
+  try {
+    // Fetch current row — scoped to this hall
+    const current = await pool.query(
+      `SELECT tournament_id, status, started_at, finished_at
+       FROM chip_tournaments
+       WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (current.rows.length === 0) {
+      return res.status(404).json({ error: 'Tournament not found' });
+    }
+
+    const row = current.rows[0];
+
+    // Resolve lifecycle timestamps
+    let started_at  = row.started_at;
+    let finished_at = row.finished_at;
+
+    if (status === 'running'  && !started_at)  started_at  = new Date();
+    if (status === 'finished' && !finished_at) finished_at = new Date();
+
+    const result = await pool.query(
+      `UPDATE chip_tournaments
+       SET name         = COALESCE($1, name),
+           status       = COALESCE($2, status),
+           config       = COALESCE($3, config),
+           fargo_config = COALESCE($4, fargo_config),
+           started_at   = $5,
+           finished_at  = $6
+       WHERE tournament_id = $7 AND poolhall_id = $8
+       RETURNING tournament_id, poolhall_id, name, status,
+                 config, fargo_config, created_at, started_at, finished_at`,
+      [name || null,
+       status || null,
+       config       ? JSON.stringify(config)       : null,
+       fargo_config ? JSON.stringify(fargo_config) : null,
+       started_at,
+       finished_at,
+       id,
+       req.hallId]
+    );
+
+    res.json({ tournament: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Start server ──────────────────────────────────────────────────────────────
