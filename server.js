@@ -874,6 +874,25 @@ app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req,
   }
 });
 
+// ── DELETE /hall/chip-tournaments/:id ─────────────────────────────────────────
+// Hard delete — CASCADE removes all roster rows (chip_tournament_players)
+// Only permitted when status is 'setup' (not mid-tournament)
+app.delete('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `DELETE FROM chip_tournaments
+       WHERE tournament_id = $1 AND poolhall_id = $2
+       RETURNING tournament_id, name, status`,
+      [id, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    res.json({ message: 'Tournament deleted', tournament: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── GET /hall/chip-tournaments/:id/players ────────────────────────────────────
 app.get('/hall/chip-tournaments/:id/players', requireAuth, requireHallAuth, async (req, res) => {
   const { id } = req.params;
