@@ -874,6 +874,93 @@ app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req,
   }
 });
 
+// ── GET /hall/chip-tournaments/:id/players ────────────────────────────────────
+app.get('/hall/chip-tournaments/:id/players', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    // Scope check: tournament must belong to this hall
+    const check = await pool.query(
+      `SELECT tournament_id FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+
+    const result = await pool.query(
+      `SELECT ctp.id, ctp.tournament_id, ctp.player_id,
+              ctp.starting_chips, ctp.current_chips, ctp.finish_position,
+              ctp.rebuys, ctp.wins, ctp.losses, ctp.payout, ctp.status, ctp.bye_count,
+              p.first_name, p.last_name, p.hall_rating, p.fargo_rating, p.tier
+       FROM chip_tournament_players ctp
+       JOIN player p ON ctp.player_id = p.player_id
+       WHERE ctp.tournament_id = $1
+       ORDER BY ctp.id ASC`,
+      [id]
+    );
+    res.json({ players: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/chip-tournaments/:id/players ───────────────────────────────────
+// Body: { player_id, starting_chips, current_chips }
+app.post('/hall/chip-tournaments/:id/players', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { player_id, starting_chips, current_chips } = req.body;
+  if (!player_id) return res.status(400).json({ error: 'player_id is required' });
+  try {
+    // Scope check: tournament must belong to this hall
+    const check = await pool.query(
+      `SELECT tournament_id FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+
+    // Scope check: player must belong to this hall
+    const playerCheck = await pool.query(
+      `SELECT player_id FROM player WHERE player_id = $1 AND poolhall_id = $2 AND deleted_at IS NULL`,
+      [player_id, req.hallId]
+    );
+    if (playerCheck.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+
+    const result = await pool.query(
+      `INSERT INTO chip_tournament_players
+         (tournament_id, player_id, starting_chips, current_chips, status)
+       VALUES ($1, $2, $3, $4, 'waiting')
+       ON CONFLICT (tournament_id, player_id) DO NOTHING
+       RETURNING *`,
+      [id, player_id, starting_chips || null, current_chips || null]
+    );
+    res.status(201).json({ player: result.rows[0] || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /hall/chip-tournaments/:id/players/:playerId ───────────────────────
+app.delete('/hall/chip-tournaments/:id/players/:playerId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, playerId } = req.params;
+  try {
+    // Scope check: tournament must belong to this hall
+    const check = await pool.query(
+      `SELECT tournament_id FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+
+    const result = await pool.query(
+      `DELETE FROM chip_tournament_players
+       WHERE tournament_id = $1 AND player_id = $2
+       RETURNING id, player_id`,
+      [id, playerId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Player not in tournament' });
+    res.json({ message: 'Player removed from tournament', player: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Rack It Up API running on port ${PORT}`);
