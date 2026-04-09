@@ -980,6 +980,161 @@ app.delete('/hall/chip-tournaments/:id/players/:playerId', requireAuth, requireH
   }
 });
 
+// ── PUT /hall/chip-tournaments/:id/players/:playerId ──────────────────────────
+// Updates a single player's row in chip_tournament_players.
+// Used to mark the champion (status='champion', finish_position=1) at tournament end.
+// Body: { status, finish_position, current_chips, wins, losses } — all optional
+app.put('/hall/chip-tournaments/:id/players/:playerId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, playerId } = req.params;
+  const { status, finish_position, current_chips, wins, losses } = req.body;
+
+  try {
+    const check = await pool.query(
+      `SELECT tournament_id FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+
+    const result = await pool.query(
+      `UPDATE chip_tournament_players
+       SET status          = COALESCE($1, status),
+           finish_position = COALESCE($2, finish_position),
+           current_chips   = COALESCE($3, current_chips),
+           wins            = COALESCE($4, wins),
+           losses          = COALESCE($5, losses)
+       WHERE tournament_id = $6 AND player_id = $7
+       RETURNING id, player_id, status, finish_position`,
+      [status || null, finish_position || null, current_chips ?? null, wins ?? null, losses ?? null, id, playerId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Player not in tournament' });
+    res.json({ player: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/chip-tournaments/:id/matches ───────────────────────────────────
+// Creates a single match row. Called by drawNextMatches() for each pairing.
+// Body: { round_seq, table_number, p1_player_id, p2_player_id, breaker_player_id }
+// Returns the new match_id (DB PK) so the frontend can store it for later PUT.
+app.post('/hall/chip-tournaments/:id/matches', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { round_seq, table_number, p1_player_id, p2_player_id, breaker_player_id } = req.body;
+
+  if (!round_seq || !table_number || !p1_player_id || !p2_player_id || !breaker_player_id) {
+    return res.status(400).json({ error: 'round_seq, table_number, p1_player_id, p2_player_id, breaker_player_id are required' });
+  }
+
+  try {
+    // Scope check: tournament must belong to this hall and be running
+    const check = await pool.query(
+      `SELECT tournament_id, status FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    if (check.rows[0].status !== 'running') return res.status(409).json({ error: 'Tournament is not running' });
+
+    const result = await pool.query(
+      `INSERT INTO chip_matches
+         (tournament_id, round_seq, table_number, p1_id, p2_id, breaker_id, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'playing', NOW())
+       RETURNING match_id`,
+      [id, round_seq, table_number, p1_player_id, p2_player_id, breaker_player_id]
+    );
+
+    res.status(201).json({ match_id: result.rows[0].match_id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/chip-tournaments/:id/matches/:matchId ───────────────────────────
+// Records a match result. Updates chip_matches and both players' rows in
+// chip_tournament_players in a single transaction.
+// Body: { winner_player_id, loser_player_id, winner_chips, loser_chips,
+//         winner_wins, loser_losses, winner_status, loser_status,
+//         loser_finish_position (optional, set when eliminated) }
+app.put('/hall/chip-tournaments/:id/matches/:matchId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, matchId } = req.params;
+  const {
+    winner_player_id,
+    loser_player_id,
+    winner_chips,
+    loser_chips,
+    winner_wins,
+    loser_losses,
+    winner_status,
+    loser_status,
+    loser_finish_position
+  } = req.body;
+
+  if (!winner_player_id || !loser_player_id) {
+    return res.status(400).json({ error: 'winner_player_id and loser_player_id are required' });
+  }
+
+  try {
+    // Scope check
+    const check = await pool.query(
+      `SELECT cm.match_id, cm.status
+       FROM chip_matches cm
+       JOIN chip_tournaments ct ON ct.tournament_id = cm.tournament_id
+       WHERE cm.match_id = $1 AND cm.tournament_id = $2 AND ct.poolhall_id = $3`,
+      [matchId, id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Match not found' });
+    if (check.rows[0].status === 'done') return res.status(409).json({ error: 'Match already recorded' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Update the match row
+      await client.query(
+        `UPDATE chip_matches
+         SET status      = 'done',
+             winner_id   = $1,
+             loser_id    = $2,
+             finished_at = NOW()
+         WHERE match_id = $3`,
+        [winner_player_id, loser_player_id, matchId]
+      );
+
+      // Update winner's player row
+      await client.query(
+        `UPDATE chip_tournament_players
+         SET current_chips = $1,
+             wins          = $2,
+             status        = $3
+         WHERE tournament_id = $4 AND player_id = $5`,
+        [winner_chips, winner_wins, winner_status, id, winner_player_id]
+      );
+
+      // Update loser's player row (include finish_position if eliminated)
+      await client.query(
+        `UPDATE chip_tournament_players
+         SET current_chips   = $1,
+             losses          = $2,
+             status          = $3,
+             finish_position = COALESCE($4, finish_position)
+         WHERE tournament_id = $5 AND player_id = $6`,
+        [loser_chips, loser_losses, loser_status,
+         loser_finish_position || null,
+         id, loser_player_id]
+      );
+
+      await client.query('COMMIT');
+      res.json({ message: 'Match result recorded' });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Rack It Up API running on port ${PORT}`);
