@@ -881,7 +881,8 @@ app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req,
       const players = await client.query(
         `SELECT player_id, wins, losses, rebuys, payout
          FROM chip_tournament_players
-         WHERE tournament_id = $1`,
+         WHERE tournament_id = $1
+           AND status IN ('champion', 'eliminated')`,
         [id]
       );
 
@@ -927,6 +928,49 @@ app.delete('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (r
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
     res.json({ message: 'Tournament deleted', tournament: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/chip-tournaments/:id ────────────────────────────────────────────
+app.get('/hall/chip-tournaments/:id', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT tournament_id, poolhall_id, name, status,
+              config, fargo_config, created_at, started_at, finished_at
+       FROM chip_tournaments
+       WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    res.json({ tournament: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/chip-tournaments/:id/matches ────────────────────────────────────
+app.get('/hall/chip-tournaments/:id/matches', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const check = await pool.query(
+      `SELECT tournament_id FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+
+    const result = await pool.query(
+      `SELECT match_id, tournament_id, round_seq, table_number,
+              p1_id, p2_id, breaker_id, winner_id, loser_id,
+              status, created_at, finished_at
+       FROM chip_matches
+       WHERE tournament_id = $1
+       ORDER BY match_id ASC`,
+      [id]
+    );
+    res.json({ matches: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
