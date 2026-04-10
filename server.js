@@ -28,8 +28,14 @@ app.use(cors({
     } else {
       callback(new Error('Not allowed by CORS: ' + origin));
     }
-  }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
+// Explicitly handle OPTIONS preflight for all routes
+app.options('*', cors());
 
 app.use(express.json());
 
