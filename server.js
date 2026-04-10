@@ -20,22 +20,27 @@ const allowedOrigins = (process.env.ALLOWED_ORIGIN || '')
   .map(o => o.trim())
   .filter(Boolean);
 
-app.use(cors({
+console.log('Allowed CORS origins:', allowedOrigins);
+
+const corsOptions = {
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
+      console.warn('CORS blocked origin:', origin);
       callback(new Error('Not allowed by CORS: ' + origin));
     }
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
-}));
+};
 
-// Explicitly handle OPTIONS preflight for all routes
-app.options('*', cors());
+app.use(cors(corsOptions));
+
+// Explicitly handle OPTIONS preflight for all routes using same config
+app.options('*', cors(corsOptions));
 
 app.use(express.json());
 
