@@ -1141,7 +1141,86 @@ app.post('/hall/chip-tournaments/:id/matches', requireAuth, requireHallAdmin, as
   }
 });
 
-// ── PUT /hall/chip-tournaments/:id/matches/:matchId ───────────────────────────
+// ── DELETE /hall/chip-tournaments/:id/matches/:matchId/result ─────────────────
+// Reverses a recorded match result — resets match to 'playing', clears
+// winner_id/loser_id, and restores both players' chips/wins/losses/status
+// in a single transaction. Used by the "Correct result" flow on the frontend.
+// Body: { p1_player_id, p1_chips, p1_wins, p1_losses, p1_status,
+//         p2_player_id, p2_chips, p2_wins, p2_losses, p2_status,
+//         p1_finish_position (null to clear), p2_finish_position (null to clear) }
+app.delete('/hall/chip-tournaments/:id/matches/:matchId/result', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, matchId } = req.params;
+  const { p1_player_id, p1_chips, p1_wins, p1_losses, p1_status,
+          p2_player_id, p2_chips, p2_wins, p2_losses, p2_status } = req.body;
+
+  if (!p1_player_id || !p2_player_id) {
+    return res.status(400).json({ error: 'p1_player_id and p2_player_id are required' });
+  }
+
+  try {
+    const check = await pool.query(
+      `SELECT cm.match_id, cm.status
+       FROM chip_matches cm
+       JOIN chip_tournaments ct ON ct.tournament_id = cm.tournament_id
+       WHERE cm.match_id = $1 AND cm.tournament_id = $2 AND ct.poolhall_id = $3`,
+      [matchId, id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Match not found' });
+    if (check.rows[0].status !== 'done') return res.status(409).json({ error: 'Match is not done — nothing to reverse' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Reset match row
+      await client.query(
+        `UPDATE chip_matches
+         SET status      = 'playing',
+             winner_id   = NULL,
+             loser_id    = NULL,
+             finished_at = NULL
+         WHERE match_id = $1`,
+        [matchId]
+      );
+
+      // Restore p1 player row
+      await client.query(
+        `UPDATE chip_tournament_players
+         SET current_chips   = $1,
+             wins            = $2,
+             losses          = $3,
+             status          = $4,
+             finish_position = NULL
+         WHERE tournament_id = $5 AND player_id = $6`,
+        [p1_chips, p1_wins, p1_losses, p1_status, id, p1_player_id]
+      );
+
+      // Restore p2 player row
+      await client.query(
+        `UPDATE chip_tournament_players
+         SET current_chips   = $1,
+             wins            = $2,
+             losses          = $3,
+             status          = $4,
+             finish_position = NULL
+         WHERE tournament_id = $5 AND player_id = $6`,
+        [p2_chips, p2_wins, p2_losses, p2_status, id, p2_player_id]
+      );
+
+      await client.query('COMMIT');
+      res.json({ message: 'Match result reversed' });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // Records a match result. Updates chip_matches and both players' rows in
 // chip_tournament_players in a single transaction.
 // Body: { winner_player_id, loser_player_id, winner_chips, loser_chips,
@@ -1175,7 +1254,6 @@ app.put('/hall/chip-tournaments/:id/matches/:matchId', requireAuth, requireHallA
       [matchId, id, req.hallId]
     );
     if (check.rows.length === 0) return res.status(404).json({ error: 'Match not found' });
-    if (check.rows[0].status === 'done') return res.status(409).json({ error: 'Match already recorded' });
 
     const client = await pool.connect();
     try {
