@@ -817,6 +817,9 @@ app.post('/hall/chip-tournaments', requireAuth, requireHallAdmin, async (req, re
 // Updates name, status, config, fargo_config, and lifecycle timestamps.
 // Sets started_at when status transitions to 'running' (if not already set).
 // Sets finished_at when status transitions to 'finished' (if not already set).
+// On first transition to 'finished': upserts chip_player_stats for every
+// player in the tournament (tournaments_played, wins, losses, rebuys,
+// earnings, last_played_at) scoped to this pool hall.
 app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   const { name, status, config, fargo_config } = req.body;
@@ -826,19 +829,24 @@ app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req,
     return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
   }
 
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+
     // Fetch current row — scoped to this hall
-    const current = await pool.query(
+    const current = await client.query(
       `SELECT tournament_id, status, started_at, finished_at
        FROM chip_tournaments
        WHERE tournament_id = $1 AND poolhall_id = $2`,
       [id, req.hallId]
     );
     if (current.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Tournament not found' });
     }
 
     const row = current.rows[0];
+    const isNewFinish = (status === 'finished' && row.status !== 'finished');
 
     // Resolve lifecycle timestamps
     let started_at  = row.started_at;
@@ -847,7 +855,7 @@ app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req,
     if (status === 'running'  && !started_at)  started_at  = new Date();
     if (status === 'finished' && !finished_at) finished_at = new Date();
 
-    const result = await pool.query(
+    const result = await client.query(
       `UPDATE chip_tournaments
        SET name         = COALESCE($1, name),
            status       = COALESCE($2, status),
@@ -868,9 +876,40 @@ app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req,
        req.hallId]
     );
 
+    // On first finish transition: upsert lifetime stats for every participant
+    if (isNewFinish) {
+      const players = await client.query(
+        `SELECT player_id, wins, losses, rebuys, payout
+         FROM chip_tournament_players
+         WHERE tournament_id = $1`,
+        [id]
+      );
+
+      for (const p of players.rows) {
+        await client.query(
+          `INSERT INTO chip_player_stats
+             (player_id, poolhall_id, tournaments_played, total_wins, total_losses,
+              total_rebuys, total_earnings, last_played_at)
+           VALUES ($1, $2, 1, $3, $4, $5, $6, NOW())
+           ON CONFLICT (player_id, poolhall_id) DO UPDATE
+             SET tournaments_played = chip_player_stats.tournaments_played + 1,
+                 total_wins         = chip_player_stats.total_wins   + EXCLUDED.total_wins,
+                 total_losses       = chip_player_stats.total_losses + EXCLUDED.total_losses,
+                 total_rebuys       = chip_player_stats.total_rebuys + EXCLUDED.total_rebuys,
+                 total_earnings     = chip_player_stats.total_earnings + EXCLUDED.total_earnings,
+                 last_played_at     = NOW()`,
+          [p.player_id, req.hallId, p.wins, p.losses, p.rebuys, p.payout || 0]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
     res.json({ tournament: result.rows[0] });
   } catch (err) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -982,11 +1021,12 @@ app.delete('/hall/chip-tournaments/:id/players/:playerId', requireAuth, requireH
 
 // ── PUT /hall/chip-tournaments/:id/players/:playerId ──────────────────────────
 // Updates a single player's row in chip_tournament_players.
-// Used to mark the champion (status='champion', finish_position=1) at tournament end.
-// Body: { status, finish_position, current_chips, wins, losses } — all optional
+// Used to mark the champion (status='champion', finish_position=1) at tournament
+// end, and to write each player's payout and final stats on completion.
+// Body: { status, finish_position, current_chips, wins, losses, payout } — all optional
 app.put('/hall/chip-tournaments/:id/players/:playerId', requireAuth, requireHallAdmin, async (req, res) => {
   const { id, playerId } = req.params;
-  const { status, finish_position, current_chips, wins, losses } = req.body;
+  const { status, finish_position, current_chips, wins, losses, payout } = req.body;
 
   try {
     const check = await pool.query(
@@ -1001,10 +1041,13 @@ app.put('/hall/chip-tournaments/:id/players/:playerId', requireAuth, requireHall
            finish_position = COALESCE($2, finish_position),
            current_chips   = COALESCE($3, current_chips),
            wins            = COALESCE($4, wins),
-           losses          = COALESCE($5, losses)
-       WHERE tournament_id = $6 AND player_id = $7
-       RETURNING id, player_id, status, finish_position`,
-      [status || null, finish_position || null, current_chips ?? null, wins ?? null, losses ?? null, id, playerId]
+           losses          = COALESCE($5, losses),
+           payout          = COALESCE($6, payout)
+       WHERE tournament_id = $7 AND player_id = $8
+       RETURNING id, player_id, status, finish_position, payout`,
+      [status || null, finish_position || null, current_chips ?? null, wins ?? null, losses ?? null,
+       payout != null ? payout : null,
+       id, playerId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Player not in tournament' });
     res.json({ player: result.rows[0] });
