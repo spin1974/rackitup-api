@@ -294,11 +294,11 @@ app.get('/admin/stats', requireAuth, requireSiteAdmin, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
-        (SELECT COUNT(*) FROM users           WHERE deleted_at IS NULL)                         AS user_count,
-        (SELECT COUNT(*) FROM poolhall        WHERE poolhall_id > 1)                            AS poolhall_count,
-        (SELECT COUNT(*) FROM player          WHERE deleted_at IS NULL)                         AS player_count,
-        (SELECT COUNT(*) FROM chip_tournaments WHERE status = 'finished')                       AS tournaments_finished,
-        (SELECT COUNT(*) FROM chip_tournaments WHERE status IN ('setup', 'running'))            AS tournaments_active
+        (SELECT COUNT(*) FROM users           WHERE deleted_at IS NULL)              AS user_count,
+        (SELECT COUNT(*) FROM poolhall        WHERE poolhall_id > 1)                 AS poolhall_count,
+        (SELECT COUNT(*) FROM player          WHERE deleted_at IS NULL)              AS player_count,
+        (SELECT COUNT(*) FROM chip_tournaments WHERE status = 'finished')            AS tournaments_finished,
+        (SELECT COUNT(*) FROM chip_tournaments WHERE status IN ('setup', 'running')) AS tournaments_active
     `);
     res.json(result.rows[0]);
   } catch (err) {
@@ -560,6 +560,67 @@ app.put('/admin/poolhalls/:id/settings', requireAuth, requireSiteAdmin, async (r
       );
     }
     res.json({ message: `${entries.length} setting(s) saved` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /admin/db/orphans ─────────────────────────────────────────────────────
+// Returns open tournaments (setup/running) older than min_age_days, all halls.
+// ?min_age_days=0 returns all open tournaments regardless of age.
+app.get('/admin/db/orphans', requireAuth, requireSiteAdmin, async (req, res) => {
+  const minDays = parseInt(req.query.min_age_days, 10);
+  if (isNaN(minDays) || minDays < 0) {
+    return res.status(400).json({ error: 'min_age_days must be a non-negative integer' });
+  }
+  try {
+    const result = await pool.query(`
+      SELECT
+        ct.tournament_id,
+        ct.name,
+        ct.status,
+        ct.created_at,
+        ph.poolhall_id,
+        ph.poolhall_name,
+        ph.city,
+        ph.province_state,
+        EXTRACT(EPOCH FROM (NOW() - ct.created_at)) / 86400 AS age_days,
+        (SELECT COUNT(*) FROM chip_tournament_players ctp
+         WHERE ctp.tournament_id = ct.tournament_id)         AS player_count
+      FROM chip_tournaments ct
+      JOIN poolhall ph ON ph.poolhall_id = ct.poolhall_id
+      WHERE ct.status IN ('setup', 'running')
+        AND ct.created_at < NOW() - ($1 || ' days')::INTERVAL
+      ORDER BY ct.created_at ASC
+    `, [minDays]);
+    res.json({ orphans: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /admin/db/tournaments/:id ─────────────────────────────────────────
+// Hard-deletes any tournament by ID (site_admin only). Cascades to roster +
+// matches. Logs the action. Use only after confirming with the pool hall.
+app.delete('/admin/db/tournaments/:id', requireAuth, requireSiteAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    // Fetch tournament details before deleting for the log
+    const check = await pool.query(
+      `SELECT ct.tournament_id, ct.name, ct.status, ct.created_at,
+              ph.poolhall_name
+       FROM chip_tournaments ct
+       JOIN poolhall ph ON ph.poolhall_id = ct.poolhall_id
+       WHERE ct.tournament_id = $1`,
+      [id]
+    );
+    if (check.rows.length === 0) {
+      return res.status(404).json({ error: 'Tournament not found' });
+    }
+    const t = check.rows[0];
+    await pool.query(`DELETE FROM chip_tournaments WHERE tournament_id = $1`, [id]);
+    console.log(`[ADMIN DELETE] tournament_id=${t.tournament_id} name="${t.name}" hall="${t.poolhall_name}" status=${t.status} created=${t.created_at} deleted_by=user_id:${req.user.user_id}`);
+    res.json({ deleted: true, tournament_id: t.tournament_id, name: t.name });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
