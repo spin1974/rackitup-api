@@ -294,9 +294,11 @@ app.get('/admin/stats', requireAuth, requireSiteAdmin, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
-        (SELECT COUNT(*) FROM users    WHERE deleted_at IS NULL) AS user_count,
-        (SELECT COUNT(*) FROM poolhall WHERE poolhall_id > 1)    AS poolhall_count,
-        (SELECT COUNT(*) FROM player   WHERE deleted_at IS NULL) AS player_count
+        (SELECT COUNT(*) FROM users           WHERE deleted_at IS NULL)                         AS user_count,
+        (SELECT COUNT(*) FROM poolhall        WHERE poolhall_id > 1)                            AS poolhall_count,
+        (SELECT COUNT(*) FROM player          WHERE deleted_at IS NULL)                         AS player_count,
+        (SELECT COUNT(*) FROM chip_tournaments WHERE status = 'finished')                       AS tournaments_finished,
+        (SELECT COUNT(*) FROM chip_tournaments WHERE status IN ('setup', 'running'))            AS tournaments_active
     `);
     res.json(result.rows[0]);
   } catch (err) {
