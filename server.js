@@ -395,6 +395,35 @@ app.put('/admin/users/:id/unlock', requireAuth, requireSiteAdmin, async (req, re
   }
 });
 
+// ── PUT /admin/users/:id/password ─────────────────────────────────────────────
+// Site admin resets any user's password — no current password required.
+// Different from /auth/change-password which requires the current password.
+app.put('/admin/users/:id/password', requireAuth, requireSiteAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { new_password } = req.body;
+  if (!new_password || new_password.length < 8) {
+    return res.status(400).json({ error: 'new_password must be at least 8 characters.' });
+  }
+  try {
+    const check = await pool.query(
+      `SELECT user_id FROM users WHERE user_id = $1 AND deleted_at IS NULL`,
+      [id]
+    );
+    if (!check.rows.length) return res.status(404).json({ error: 'User not found.' });
+    const hash = await bcrypt.hash(new_password, 12);
+    await pool.query(
+      `UPDATE users
+       SET user_password = $1, password_changed_at = NOW(), updated_at = NOW()
+       WHERE user_id = $2`,
+      [hash, id]
+    );
+    res.json({ message: 'Password reset.' });
+  } catch (err) {
+    console.error('Admin reset password error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── DELETE /admin/users/:id (soft delete) ─────────────────────────────────────
 app.delete('/admin/users/:id', requireAuth, requireSiteAdmin, async (req, res) => {
   const { id } = req.params;
@@ -1288,7 +1317,7 @@ app.delete('/hall/chip-tournaments/:id/matches/:matchId/result', requireAuth, re
   }
 });
 
-
+// ── PUT /hall/chip-tournaments/:id/matches/:matchId ───────────────────────────
 // Records a match result. Updates chip_matches and both players' rows in
 // chip_tournament_players in a single transaction.
 // Body: { winner_player_id, loser_player_id, winner_chips, loser_chips,
