@@ -444,6 +444,23 @@ app.delete('/admin/users/:id', requireAuth, requireSiteAdmin, async (req, res) =
   }
 });
 
+// ── PUT /admin/users/:id/restore (undo soft delete) ──────────────────────────
+app.put('/admin/users/:id/restore', requireAuth, requireSiteAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `UPDATE users SET deleted_at = NULL, updated_at = NOW()
+       WHERE user_id = $1 AND deleted_at IS NOT NULL
+       RETURNING user_id, user_name`,
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User not found or not deleted' });
+    res.json({ message: 'User restored', user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── GET /admin/poolhalls ──────────────────────────────────────────────────────
 app.get('/admin/poolhalls', requireAuth, requireSiteAdmin, async (req, res) => {
   try {
