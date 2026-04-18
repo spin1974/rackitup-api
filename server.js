@@ -1550,6 +1550,216 @@ app.delete('/hall/league-sessions/:id/players/:playerId', requireAuth, requireHa
   }
 });
 
+// ── PUT /hall/league-sessions/:id/assignments ─────────────────────────────────
+// Bulk-upsert side + group_name for all session roster players.
+// Body: [{ player_id, side, group_name }, ...]
+// Called at createMatches() time. Silently ignores player_ids not in roster.
+app.put('/hall/league-sessions/:id/assignments', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const assignments = req.body;
+
+  if (!Array.isArray(assignments) || assignments.length === 0) {
+    return res.status(400).json({ error: 'assignments must be a non-empty array' });
+  }
+
+  try {
+    const check = await pool.query(
+      `SELECT session_id FROM league_sessions WHERE session_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const a of assignments) {
+        if (!a.player_id) continue;
+        await client.query(
+          `UPDATE league_session_players
+           SET side = $1, group_name = $2
+           WHERE session_id = $3 AND player_id = $4`,
+          [a.side || null, a.group_name || null, id, a.player_id]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ message: `${assignments.length} assignments written` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/league-sessions/:id/matches ────────────────────────────────────
+// Bulk-insert all matches for a session. Deletes existing matches first.
+// Also transitions session status → 'running' and sets started_at.
+// Body: { matches: [{ group_idx, side_id, round_num, is_rotate,
+//                     p1_id, p2_id, breaker_id }] }
+// Returns: { matches: [...rows with match_id in insertion order] }
+app.post('/hall/league-sessions/:id/matches', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { matches } = req.body;
+
+  if (!Array.isArray(matches) || matches.length === 0) {
+    return res.status(400).json({ error: 'matches must be a non-empty array' });
+  }
+
+  try {
+    const check = await pool.query(
+      `SELECT session_id, status, started_at FROM league_sessions
+       WHERE session_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+    const started_at = check.rows[0].started_at || new Date();
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      await client.query(
+        `DELETE FROM tryleague_matches WHERE session_id = $1`,
+        [id]
+      );
+
+      await client.query(
+        `UPDATE league_sessions
+         SET status = 'running', started_at = $1
+         WHERE session_id = $2`,
+        [started_at, id]
+      );
+
+      const inserted = [];
+      for (const m of matches) {
+        const result = await client.query(
+          `INSERT INTO tryleague_matches
+             (session_id, group_idx, side_id, round_num, is_rotate,
+              p1_id, p2_id, breaker_id, status, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW())
+           RETURNING match_id, group_idx, side_id, round_num, is_rotate,
+                     p1_id, p2_id, breaker_id, status, created_at`,
+          [id,
+           m.group_idx,
+           m.side_id,
+           m.round_num,
+           m.is_rotate || false,
+           m.p1_id,
+           m.p2_id,
+           m.breaker_id]
+        );
+        inserted.push(result.rows[0]);
+      }
+
+      await client.query('COMMIT');
+      res.status(201).json({ matches: inserted });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/league-sessions/:id/matches ─────────────────────────────────────
+// Returns all matches for a session (needed for Phase 5 resume).
+app.get('/hall/league-sessions/:id/matches', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const check = await pool.query(
+      `SELECT session_id FROM league_sessions WHERE session_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+    const result = await pool.query(
+      `SELECT match_id, session_id, group_idx, side_id, round_num, is_rotate,
+              p1_id, p2_id, breaker_id, winner_id,
+              score1, score2, status, created_at, finished_at
+       FROM tryleague_matches
+       WHERE session_id = $1
+       ORDER BY match_id ASC`,
+      [id]
+    );
+    res.json({ matches: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/league-sessions/:id/matches/:matchId ────────────────────────────
+// Update a single match. Handles all transitions:
+//   pending → playing     (setPlaying): body { status: 'playing' }
+//   playing → done        (score submit): body { status:'done', score1, score2, winner_id }
+//   done    → done        (score edit): same as above
+//   done    → playing     (re-open): body { status: 'playing' }
+// finished_at is set on → done, cleared on → playing.
+app.put('/hall/league-sessions/:id/matches/:matchId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, matchId } = req.params;
+  const { status, score1, score2, winner_id } = req.body;
+
+  const validStatuses = ['pending', 'playing', 'done'];
+  if (status && !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+  }
+
+  try {
+    const sessionCheck = await pool.query(
+      `SELECT session_id FROM league_sessions WHERE session_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (sessionCheck.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+    const matchCheck = await pool.query(
+      `SELECT match_id, status FROM tryleague_matches
+       WHERE match_id = $1 AND session_id = $2`,
+      [matchId, id]
+    );
+    if (matchCheck.rows.length === 0) return res.status(404).json({ error: 'Match not found' });
+
+    // finished_at: set when → done, clear when → playing/pending, unchanged otherwise
+    let finished_at_expr;
+    if (status === 'done') {
+      finished_at_expr = 'NOW()';
+    } else if (status === 'playing' || status === 'pending') {
+      finished_at_expr = 'NULL';
+    } else {
+      finished_at_expr = 'finished_at';
+    }
+
+    const result = await pool.query(
+      `UPDATE tryleague_matches
+       SET status      = COALESCE($1, status),
+           score1      = $2,
+           score2      = $3,
+           winner_id   = $4,
+           finished_at = ${finished_at_expr}
+       WHERE match_id = $5 AND session_id = $6
+       RETURNING match_id, session_id, group_idx, side_id, round_num, is_rotate,
+                 p1_id, p2_id, breaker_id, winner_id,
+                 score1, score2, status, created_at, finished_at`,
+      [status || null,
+       score1 ?? null,
+       score2 ?? null,
+       winner_id ?? null,
+       matchId,
+       id]
+    );
+
+    res.json({ match: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Rack It Up API running on port ${PORT}`);
