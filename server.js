@@ -577,7 +577,6 @@ app.get('/admin/poolhalls/:id/settings', requireAuth, requireSiteAdmin, async (r
        ORDER BY setting_name`,
       [id]
     );
-    // Return as flat key→value object for convenience
     const settings = {};
     result.rows.forEach(r => { settings[r.setting_name] = r.setting_value; });
     res.json({ settings });
@@ -651,7 +650,6 @@ app.get('/admin/db/orphans', requireAuth, requireSiteAdmin, async (req, res) => 
 app.delete('/admin/db/tournaments/:id', requireAuth, requireSiteAdmin, async (req, res) => {
   const { id } = req.params;
   try {
-    // Fetch tournament details before deleting for the log
     const check = await pool.query(
       `SELECT ct.tournament_id, ct.name, ct.status, ct.created_at,
               ph.poolhall_name
@@ -832,7 +830,6 @@ app.put('/hall/players/:id', requireAuth, requireHallAdmin, async (req, res) => 
     return res.status(400).json({ error: 'tier must be A, B, C, or D' });
   }
   try {
-    // Scope check: ensure player belongs to this hall
     const result = await pool.query(
       `UPDATE player
        SET first_name    = COALESCE($1,  first_name),
@@ -908,8 +905,6 @@ app.get('/hall/chip-tournaments', requireAuth, requireHallAuth, async (req, res)
 
 // ── POST /hall/chip-tournaments ───────────────────────────────────────────────
 // Body: { name, config, fargo_config }
-// name is optional — defaults to date + sequence if omitted (applied client-side)
-// config and fargo_config are full JSONB objects
 app.post('/hall/chip-tournaments', requireAuth, requireHallAdmin, async (req, res) => {
   const { name, config, fargo_config } = req.body;
   if (!config || typeof config !== 'object') {
@@ -934,12 +929,6 @@ app.post('/hall/chip-tournaments', requireAuth, requireHallAdmin, async (req, re
 });
 
 // ── PUT /hall/chip-tournaments/:id ────────────────────────────────────────────
-// Updates name, status, config, fargo_config, and lifecycle timestamps.
-// Sets started_at when status transitions to 'running' (if not already set).
-// Sets finished_at when status transitions to 'finished' (if not already set).
-// On first transition to 'finished': upserts chip_player_stats for every
-// player in the tournament (tournaments_played, wins, losses, rebuys,
-// earnings, last_played_at) scoped to this pool hall.
 app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   const { name, status, config, fargo_config } = req.body;
@@ -953,7 +942,6 @@ app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req,
   try {
     await client.query('BEGIN');
 
-    // Fetch current row — scoped to this hall
     const current = await client.query(
       `SELECT tournament_id, status, started_at, finished_at
        FROM chip_tournaments
@@ -968,7 +956,6 @@ app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req,
     const row = current.rows[0];
     const isNewFinish = (status === 'finished' && row.status !== 'finished');
 
-    // Resolve lifecycle timestamps
     let started_at  = row.started_at;
     let finished_at = row.finished_at;
 
@@ -996,7 +983,6 @@ app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req,
        req.hallId]
     );
 
-    // On first finish transition: upsert lifetime stats for every participant
     if (isNewFinish) {
       const players = await client.query(
         `SELECT player_id, wins, losses, rebuys, payout
@@ -1035,8 +1021,6 @@ app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req,
 });
 
 // ── DELETE /hall/chip-tournaments/:id ─────────────────────────────────────────
-// Hard delete — CASCADE removes all roster rows (chip_tournament_players)
-// Only permitted when status is 'setup' (not mid-tournament)
 app.delete('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   try {
@@ -1100,7 +1084,6 @@ app.get('/hall/chip-tournaments/:id/matches', requireAuth, requireHallAuth, asyn
 app.get('/hall/chip-tournaments/:id/players', requireAuth, requireHallAuth, async (req, res) => {
   const { id } = req.params;
   try {
-    // Scope check: tournament must belong to this hall
     const check = await pool.query(
       `SELECT tournament_id FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
       [id, req.hallId]
@@ -1125,20 +1108,17 @@ app.get('/hall/chip-tournaments/:id/players', requireAuth, requireHallAuth, asyn
 });
 
 // ── POST /hall/chip-tournaments/:id/players ───────────────────────────────────
-// Body: { player_id, starting_chips, current_chips }
 app.post('/hall/chip-tournaments/:id/players', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   const { player_id, starting_chips, current_chips } = req.body;
   if (!player_id) return res.status(400).json({ error: 'player_id is required' });
   try {
-    // Scope check: tournament must belong to this hall
     const check = await pool.query(
       `SELECT tournament_id FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
       [id, req.hallId]
     );
     if (check.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
 
-    // Scope check: player must belong to this hall
     const playerCheck = await pool.query(
       `SELECT player_id FROM player WHERE player_id = $1 AND poolhall_id = $2 AND deleted_at IS NULL`,
       [player_id, req.hallId]
@@ -1163,7 +1143,6 @@ app.post('/hall/chip-tournaments/:id/players', requireAuth, requireHallAdmin, as
 app.delete('/hall/chip-tournaments/:id/players/:playerId', requireAuth, requireHallAdmin, async (req, res) => {
   const { id, playerId } = req.params;
   try {
-    // Scope check: tournament must belong to this hall
     const check = await pool.query(
       `SELECT tournament_id FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
       [id, req.hallId]
@@ -1184,10 +1163,6 @@ app.delete('/hall/chip-tournaments/:id/players/:playerId', requireAuth, requireH
 });
 
 // ── PUT /hall/chip-tournaments/:id/players/:playerId ──────────────────────────
-// Updates a single player's row in chip_tournament_players.
-// Used to mark the champion (status='champion', finish_position=1) at tournament
-// end, and to write each player's payout and final stats on completion.
-// Body: { status, finish_position, current_chips, wins, losses, payout } — all optional
 app.put('/hall/chip-tournaments/:id/players/:playerId', requireAuth, requireHallAdmin, async (req, res) => {
   const { id, playerId } = req.params;
   const { status, finish_position, current_chips, wins, losses, payout } = req.body;
@@ -1221,9 +1196,6 @@ app.put('/hall/chip-tournaments/:id/players/:playerId', requireAuth, requireHall
 });
 
 // ── POST /hall/chip-tournaments/:id/matches ───────────────────────────────────
-// Creates a single match row. Called by drawNextMatches() for each pairing.
-// Body: { round_seq, table_number, p1_player_id, p2_player_id, breaker_player_id }
-// Returns the new match_id (DB PK) so the frontend can store it for later PUT.
 app.post('/hall/chip-tournaments/:id/matches', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   const { round_seq, table_number, p1_player_id, p2_player_id, breaker_player_id } = req.body;
@@ -1233,7 +1205,6 @@ app.post('/hall/chip-tournaments/:id/matches', requireAuth, requireHallAdmin, as
   }
 
   try {
-    // Scope check: tournament must belong to this hall and be running
     const check = await pool.query(
       `SELECT tournament_id, status FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
       [id, req.hallId]
@@ -1256,12 +1227,6 @@ app.post('/hall/chip-tournaments/:id/matches', requireAuth, requireHallAdmin, as
 });
 
 // ── DELETE /hall/chip-tournaments/:id/matches/:matchId/result ─────────────────
-// Reverses a recorded match result — resets match to 'playing', clears
-// winner_id/loser_id, and restores both players' chips/wins/losses/status
-// in a single transaction. Used by the "Correct result" flow on the frontend.
-// Body: { p1_player_id, p1_chips, p1_wins, p1_losses, p1_status,
-//         p2_player_id, p2_chips, p2_wins, p2_losses, p2_status,
-//         p1_finish_position (null to clear), p2_finish_position (null to clear) }
 app.delete('/hall/chip-tournaments/:id/matches/:matchId/result', requireAuth, requireHallAdmin, async (req, res) => {
   const { id, matchId } = req.params;
   const { p1_player_id, p1_chips, p1_wins, p1_losses, p1_status,
@@ -1285,42 +1250,24 @@ app.delete('/hall/chip-tournaments/:id/matches/:matchId/result', requireAuth, re
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-
-      // Reset match row
       await client.query(
         `UPDATE chip_matches
-         SET status      = 'playing',
-             winner_id   = NULL,
-             loser_id    = NULL,
-             finished_at = NULL
+         SET status = 'playing', winner_id = NULL, loser_id = NULL, finished_at = NULL
          WHERE match_id = $1`,
         [matchId]
       );
-
-      // Restore p1 player row
       await client.query(
         `UPDATE chip_tournament_players
-         SET current_chips   = $1,
-             wins            = $2,
-             losses          = $3,
-             status          = $4,
-             finish_position = NULL
+         SET current_chips = $1, wins = $2, losses = $3, status = $4, finish_position = NULL
          WHERE tournament_id = $5 AND player_id = $6`,
         [p1_chips, p1_wins, p1_losses, p1_status, id, p1_player_id]
       );
-
-      // Restore p2 player row
       await client.query(
         `UPDATE chip_tournament_players
-         SET current_chips   = $1,
-             wins            = $2,
-             losses          = $3,
-             status          = $4,
-             finish_position = NULL
+         SET current_chips = $1, wins = $2, losses = $3, status = $4, finish_position = NULL
          WHERE tournament_id = $5 AND player_id = $6`,
         [p2_chips, p2_wins, p2_losses, p2_status, id, p2_player_id]
       );
-
       await client.query('COMMIT');
       res.json({ message: 'Match result reversed' });
     } catch (err) {
@@ -1335,22 +1282,13 @@ app.delete('/hall/chip-tournaments/:id/matches/:matchId/result', requireAuth, re
 });
 
 // ── PUT /hall/chip-tournaments/:id/matches/:matchId ───────────────────────────
-// Records a match result. Updates chip_matches and both players' rows in
-// chip_tournament_players in a single transaction.
-// Body: { winner_player_id, loser_player_id, winner_chips, loser_chips,
-//         winner_wins, loser_losses, winner_status, loser_status,
-//         loser_finish_position (optional, set when eliminated) }
 app.put('/hall/chip-tournaments/:id/matches/:matchId', requireAuth, requireHallAdmin, async (req, res) => {
   const { id, matchId } = req.params;
   const {
-    winner_player_id,
-    loser_player_id,
-    winner_chips,
-    loser_chips,
-    winner_wins,
-    loser_losses,
-    winner_status,
-    loser_status,
+    winner_player_id, loser_player_id,
+    winner_chips, loser_chips,
+    winner_wins, loser_losses,
+    winner_status, loser_status,
     loser_finish_position
   } = req.body;
 
@@ -1359,7 +1297,6 @@ app.put('/hall/chip-tournaments/:id/matches/:matchId', requireAuth, requireHallA
   }
 
   try {
-    // Scope check
     const check = await pool.query(
       `SELECT cm.match_id, cm.status
        FROM chip_matches cm
@@ -1372,41 +1309,25 @@ app.put('/hall/chip-tournaments/:id/matches/:matchId', requireAuth, requireHallA
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-
-      // Update the match row
       await client.query(
         `UPDATE chip_matches
-         SET status      = 'done',
-             winner_id   = $1,
-             loser_id    = $2,
-             finished_at = NOW()
+         SET status = 'done', winner_id = $1, loser_id = $2, finished_at = NOW()
          WHERE match_id = $3`,
         [winner_player_id, loser_player_id, matchId]
       );
-
-      // Update winner's player row
       await client.query(
         `UPDATE chip_tournament_players
-         SET current_chips = $1,
-             wins          = $2,
-             status        = $3
+         SET current_chips = $1, wins = $2, status = $3
          WHERE tournament_id = $4 AND player_id = $5`,
         [winner_chips, winner_wins, winner_status, id, winner_player_id]
       );
-
-      // Update loser's player row (include finish_position if eliminated)
       await client.query(
         `UPDATE chip_tournament_players
-         SET current_chips   = $1,
-             losses          = $2,
-             status          = $3,
+         SET current_chips = $1, losses = $2, status = $3,
              finish_position = COALESCE($4, finish_position)
          WHERE tournament_id = $5 AND player_id = $6`,
-        [loser_chips, loser_losses, loser_status,
-         loser_finish_position || null,
-         id, loser_player_id]
+        [loser_chips, loser_losses, loser_status, loser_finish_position || null, id, loser_player_id]
       );
-
       await client.query('COMMIT');
       res.json({ message: 'Match result recorded' });
     } catch (err) {
@@ -1415,6 +1336,215 @@ app.put('/hall/chip-tournaments/:id/matches/:matchId', requireAuth, requireHallA
     } finally {
       client.release();
     }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEAGUE SESSION ENDPOINTS — require auth + hall role
+// All routes automatically scoped to req.hallId from JWT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── GET /hall/league-sessions ─────────────────────────────────────────────────
+// Returns all sessions for this hall (all statuses), newest first
+app.get('/hall/league-sessions', requireAuth, requireHallAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT session_id, poolhall_id, name, status, config,
+              created_at, started_at, finished_at
+       FROM league_sessions
+       WHERE poolhall_id = $1
+       ORDER BY created_at DESC`,
+      [req.hallId]
+    );
+    res.json({ sessions: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/league-sessions ────────────────────────────────────────────────
+// Body: { name, config }
+// name is optional — defaults to date if omitted (applied client-side)
+app.post('/hall/league-sessions', requireAuth, requireHallAdmin, async (req, res) => {
+  const { name, config } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO league_sessions
+         (poolhall_id, name, status, config, created_at)
+       VALUES ($1, $2, 'setup', $3, NOW())
+       RETURNING session_id, poolhall_id, name, status, config, created_at`,
+      [req.hallId,
+       name || null,
+       config ? JSON.stringify(config) : JSON.stringify({})]
+    );
+    res.status(201).json({ session: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/league-sessions/:id ─────────────────────────────────────────────
+// Sets started_at on first transition to 'running', finished_at on 'finished'.
+app.put('/hall/league-sessions/:id', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { name, status, config } = req.body;
+
+  const validStatuses = ['setup', 'running', 'finished'];
+  if (status && !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+  }
+
+  try {
+    const current = await pool.query(
+      `SELECT session_id, status, started_at, finished_at
+       FROM league_sessions
+       WHERE session_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (current.rows.length === 0) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const row = current.rows[0];
+    let started_at  = row.started_at;
+    let finished_at = row.finished_at;
+
+    if (status === 'running'  && !started_at)  started_at  = new Date();
+    if (status === 'finished' && !finished_at) finished_at = new Date();
+
+    const result = await pool.query(
+      `UPDATE league_sessions
+       SET name        = COALESCE($1, name),
+           status      = COALESCE($2, status),
+           config      = COALESCE($3, config),
+           started_at  = $4,
+           finished_at = $5
+       WHERE session_id = $6 AND poolhall_id = $7
+       RETURNING session_id, poolhall_id, name, status, config,
+                 created_at, started_at, finished_at`,
+      [name || null,
+       status || null,
+       config ? JSON.stringify(config) : null,
+       started_at,
+       finished_at,
+       id,
+       req.hallId]
+    );
+
+    res.json({ session: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /hall/league-sessions/:id ──────────────────────────────────────────
+// Hard delete — CASCADE removes league_session_players. Setup status only.
+app.delete('/hall/league-sessions/:id', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const check = await pool.query(
+      `SELECT session_id, status FROM league_sessions
+       WHERE session_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+    if (check.rows[0].status !== 'setup') {
+      return res.status(409).json({ error: 'Can only delete sessions in setup status' });
+    }
+
+    const result = await pool.query(
+      `DELETE FROM league_sessions
+       WHERE session_id = $1 AND poolhall_id = $2
+       RETURNING session_id, name`,
+      [id, req.hallId]
+    );
+    res.json({ message: 'Session deleted', session: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/league-sessions/:id/players ─────────────────────────────────────
+// Returns roster with player details joined from player table
+app.get('/hall/league-sessions/:id/players', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const check = await pool.query(
+      `SELECT session_id FROM league_sessions WHERE session_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+    const result = await pool.query(
+      `SELECT lsp.id, lsp.session_id, lsp.player_id,
+              lsp.side, lsp.group_name,
+              p.first_name, p.last_name,
+              p.hall_rating, p.fargo_rating, p.tier
+       FROM league_session_players lsp
+       JOIN player p ON lsp.player_id = p.player_id
+       WHERE lsp.session_id = $1
+       ORDER BY lsp.id ASC`,
+      [id]
+    );
+    res.json({ players: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/league-sessions/:id/players ────────────────────────────────────
+// Body: { player_id } — silently ignores duplicates
+app.post('/hall/league-sessions/:id/players', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { player_id } = req.body;
+  if (!player_id) return res.status(400).json({ error: 'player_id is required' });
+
+  try {
+    const check = await pool.query(
+      `SELECT session_id FROM league_sessions WHERE session_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+    const playerCheck = await pool.query(
+      `SELECT player_id FROM player WHERE player_id = $1 AND poolhall_id = $2 AND deleted_at IS NULL`,
+      [player_id, req.hallId]
+    );
+    if (playerCheck.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+
+    const result = await pool.query(
+      `INSERT INTO league_session_players (session_id, player_id)
+       VALUES ($1, $2)
+       ON CONFLICT (session_id, player_id) DO NOTHING
+       RETURNING id, session_id, player_id`,
+      [id, player_id]
+    );
+    res.status(201).json({ player: result.rows[0] || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /hall/league-sessions/:id/players/:playerId ────────────────────────
+app.delete('/hall/league-sessions/:id/players/:playerId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, playerId } = req.params;
+  try {
+    const check = await pool.query(
+      `SELECT session_id FROM league_sessions WHERE session_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+    const result = await pool.query(
+      `DELETE FROM league_session_players
+       WHERE session_id = $1 AND player_id = $2
+       RETURNING id, player_id`,
+      [id, playerId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Player not in session' });
+    res.json({ message: 'Player removed from session', player: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
