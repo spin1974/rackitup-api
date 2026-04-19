@@ -775,15 +775,21 @@ app.get('/hall/stats', requireAuth, requireHallAuth, async (req, res) => {
 });
 
 // ── GET /hall/players ─────────────────────────────────────────────────────────
+// Returns players with lifetime try-league stats joined from tryleague_player_stats.
 app.get('/hall/players', requireAuth, requireHallAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT player_id, first_name, last_name, home_town, cell_number,
-              email_address, fargo_id, fargo_rating, hall_rating, tier,
-              created_at, updated_at
-       FROM player
-       WHERE poolhall_id = $1 AND deleted_at IS NULL
-       ORDER BY last_name ASC, first_name ASC`,
+      `SELECT p.player_id, p.first_name, p.last_name, p.home_town, p.cell_number,
+              p.email_address, p.fargo_id, p.fargo_rating, p.hall_rating, p.tier,
+              p.created_at, p.updated_at,
+              COALESCE(s.total_wins,     0) AS tl_wins,
+              COALESCE(s.total_losses,   0) AS tl_losses,
+              COALESCE(s.sessions_played,0) AS tl_sessions
+       FROM player p
+       LEFT JOIN tryleague_player_stats s
+         ON s.player_id = p.player_id AND s.poolhall_id = p.poolhall_id
+       WHERE p.poolhall_id = $1 AND p.deleted_at IS NULL
+       ORDER BY p.last_name ASC, p.first_name ASC`,
       [req.hallId]
     );
     res.json({ players: result.rows });
@@ -1346,9 +1352,9 @@ app.put('/hall/chip-tournaments/:id/matches/:matchId', requireAuth, requireHallA
 // All routes automatically scoped to req.hallId from JWT
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ── GET /hall/trytryleague-sessions ─────────────────────────────────────────────────
+// ── GET /hall/tryleague-sessions ─────────────────────────────────────────────────
 // Returns all sessions for this hall (all statuses), newest first
-app.get('/hall/trytryleague-sessions', requireAuth, requireHallAuth, async (req, res) => {
+app.get('/hall/tryleague-sessions', requireAuth, requireHallAuth, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT session_id, poolhall_id, name, status, config,
@@ -1364,10 +1370,10 @@ app.get('/hall/trytryleague-sessions', requireAuth, requireHallAuth, async (req,
   }
 });
 
-// ── POST /hall/trytryleague-sessions ────────────────────────────────────────────────
+// ── POST /hall/tryleague-sessions ────────────────────────────────────────────────
 // Body: { name, config }
 // name is optional — defaults to date if omitted (applied client-side)
-app.post('/hall/trytryleague-sessions', requireAuth, requireHallAdmin, async (req, res) => {
+app.post('/hall/tryleague-sessions', requireAuth, requireHallAdmin, async (req, res) => {
   const { name, config } = req.body;
   try {
     const result = await pool.query(
@@ -1385,9 +1391,10 @@ app.post('/hall/trytryleague-sessions', requireAuth, requireHallAdmin, async (re
   }
 });
 
-// ── PUT /hall/trytryleague-sessions/:id ─────────────────────────────────────────────
+// ── PUT /hall/tryleague-sessions/:id ─────────────────────────────────────────────
 // Sets started_at on first transition to 'running', finished_at on 'finished'.
-app.put('/hall/trytryleague-sessions/:id', requireAuth, requireHallAdmin, async (req, res) => {
+// On 'finished': upserts tryleague_player_stats. Idempotent — re-finishing is a no-op.
+app.put('/hall/tryleague-sessions/:id', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   const { name, status, config } = req.body;
 
@@ -1398,7 +1405,7 @@ app.put('/hall/trytryleague-sessions/:id', requireAuth, requireHallAdmin, async 
 
   try {
     const current = await pool.query(
-      `SELECT session_id, status, started_at, finished_at
+      `SELECT session_id, status, started_at, finished_at, poolhall_id
        FROM tryleague_sessions
        WHERE session_id = $1 AND poolhall_id = $2`,
       [id, req.hallId]
@@ -1408,40 +1415,110 @@ app.put('/hall/trytryleague-sessions/:id', requireAuth, requireHallAdmin, async 
     }
 
     const row = current.rows[0];
+    const wasAlreadyFinished = row.status === 'finished';
     let started_at  = row.started_at;
     let finished_at = row.finished_at;
 
     if (status === 'running'  && !started_at)  started_at  = new Date();
     if (status === 'finished' && !finished_at) finished_at = new Date();
 
-    const result = await pool.query(
-      `UPDATE tryleague_sessions
-       SET name        = COALESCE($1, name),
-           status      = COALESCE($2, status),
-           config      = COALESCE($3, config),
-           started_at  = $4,
-           finished_at = $5
-       WHERE session_id = $6 AND poolhall_id = $7
-       RETURNING session_id, poolhall_id, name, status, config,
-                 created_at, started_at, finished_at`,
-      [name || null,
-       status || null,
-       config ? JSON.stringify(config) : null,
-       started_at,
-       finished_at,
-       id,
-       req.hallId]
-    );
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    res.json({ session: result.rows[0] });
+      const result = await client.query(
+        `UPDATE tryleague_sessions
+         SET name        = COALESCE($1, name),
+             status      = COALESCE($2, status),
+             config      = COALESCE($3, config),
+             started_at  = $4,
+             finished_at = $5
+         WHERE session_id = $6 AND poolhall_id = $7
+         RETURNING session_id, poolhall_id, name, status, config,
+                   created_at, started_at, finished_at`,
+        [name || null,
+         status || null,
+         config ? JSON.stringify(config) : null,
+         started_at,
+         finished_at,
+         id,
+         req.hallId]
+      );
+
+      // Stats upsert — only on first finish transition
+      if (status === 'finished' && !wasAlreadyFinished) {
+        const matches = await client.query(
+          `SELECT p1_id, p2_id, winner_id
+           FROM tryleague_matches
+           WHERE session_id = $1
+             AND is_rotate = FALSE
+             AND status = 'done'
+             AND winner_id IS NOT NULL`,
+          [id]
+        );
+
+        const statsMap = new Map();
+        for (const m of matches.rows) {
+          const loserId  = m.winner_id === m.p1_id ? m.p2_id : m.p1_id;
+          const winnerId = m.winner_id;
+          if (!statsMap.has(winnerId)) statsMap.set(winnerId, { wins: 0, losses: 0 });
+          if (!statsMap.has(loserId))  statsMap.set(loserId,  { wins: 0, losses: 0 });
+          statsMap.get(winnerId).wins  += 1;
+          statsMap.get(loserId).losses += 1;
+        }
+
+        for (const [playerId, delta] of statsMap.entries()) {
+          await client.query(
+            `INSERT INTO tryleague_player_stats
+               (player_id, poolhall_id, sessions_played, total_wins, total_losses, last_played_at)
+             VALUES ($1, $2, 1, $3, $4, NOW())
+             ON CONFLICT (player_id, poolhall_id) DO UPDATE
+               SET sessions_played = tryleague_player_stats.sessions_played + 1,
+                   total_wins      = tryleague_player_stats.total_wins      + EXCLUDED.total_wins,
+                   total_losses    = tryleague_player_stats.total_losses    + EXCLUDED.total_losses,
+                   last_played_at  = NOW()`,
+            [playerId, req.hallId, delta.wins, delta.losses]
+          );
+        }
+
+        // Credit sessions_played to roster players with no scored matches
+        const allRoster = await client.query(
+          `SELECT player_id FROM tryleague_session_players WHERE session_id = $1`,
+          [id]
+        );
+        for (const rp of allRoster.rows) {
+          if (!statsMap.has(rp.player_id)) {
+            await client.query(
+              `INSERT INTO tryleague_player_stats
+                 (player_id, poolhall_id, sessions_played, total_wins, total_losses, last_played_at)
+               VALUES ($1, $2, 1, 0, 0, NOW())
+               ON CONFLICT (player_id, poolhall_id) DO UPDATE
+                 SET sessions_played = tryleague_player_stats.sessions_played + 1,
+                     last_played_at  = NOW()`,
+              [rp.player_id, req.hallId]
+            );
+          }
+        }
+
+        console.log(`Session ${id} finished: stats upserted for ${statsMap.size} players, ${allRoster.rows.length} total roster`);
+      }
+
+      await client.query('COMMIT');
+      res.json({ session: result.rows[0] });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── DELETE /hall/trytryleague-sessions/:id ──────────────────────────────────────────
+// ── DELETE /hall/tryleague-sessions/:id ──────────────────────────────────────────
 // Hard delete — CASCADE removes tryleague_session_players. Setup status only.
-app.delete('/hall/trytryleague-sessions/:id', requireAuth, requireHallAdmin, async (req, res) => {
+app.delete('/hall/tryleague-sessions/:id', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   try {
     const check = await pool.query(
@@ -1466,9 +1543,9 @@ app.delete('/hall/trytryleague-sessions/:id', requireAuth, requireHallAdmin, asy
   }
 });
 
-// ── GET /hall/trytryleague-sessions/:id/players ─────────────────────────────────────
+// ── GET /hall/tryleague-sessions/:id/players ─────────────────────────────────────
 // Returns roster with player details joined from player table
-app.get('/hall/trytryleague-sessions/:id/players', requireAuth, requireHallAuth, async (req, res) => {
+app.get('/hall/tryleague-sessions/:id/players', requireAuth, requireHallAuth, async (req, res) => {
   const { id } = req.params;
   try {
     const check = await pool.query(
@@ -1494,9 +1571,9 @@ app.get('/hall/trytryleague-sessions/:id/players', requireAuth, requireHallAuth,
   }
 });
 
-// ── POST /hall/trytryleague-sessions/:id/players ────────────────────────────────────
+// ── POST /hall/tryleague-sessions/:id/players ────────────────────────────────────
 // Body: { player_id } — silently ignores duplicates
-app.post('/hall/trytryleague-sessions/:id/players', requireAuth, requireHallAdmin, async (req, res) => {
+app.post('/hall/tryleague-sessions/:id/players', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   const { player_id } = req.body;
   if (!player_id) return res.status(400).json({ error: 'player_id is required' });
@@ -1527,8 +1604,8 @@ app.post('/hall/trytryleague-sessions/:id/players', requireAuth, requireHallAdmi
   }
 });
 
-// ── DELETE /hall/trytryleague-sessions/:id/players/:playerId ────────────────────────
-app.delete('/hall/trytryleague-sessions/:id/players/:playerId', requireAuth, requireHallAdmin, async (req, res) => {
+// ── DELETE /hall/tryleague-sessions/:id/players/:playerId ────────────────────────
+app.delete('/hall/tryleague-sessions/:id/players/:playerId', requireAuth, requireHallAdmin, async (req, res) => {
   const { id, playerId } = req.params;
   try {
     const check = await pool.query(
@@ -1550,11 +1627,11 @@ app.delete('/hall/trytryleague-sessions/:id/players/:playerId', requireAuth, req
   }
 });
 
-// ── PUT /hall/trytryleague-sessions/:id/assignments ─────────────────────────────────
+// ── PUT /hall/tryleague-sessions/:id/assignments ─────────────────────────────────
 // Bulk-upsert side + group_name for all session roster players.
 // Body: [{ player_id, side, group_name }, ...]
 // Called at createMatches() time. Silently ignores player_ids not in roster.
-app.put('/hall/trytryleague-sessions/:id/assignments', requireAuth, requireHallAdmin, async (req, res) => {
+app.put('/hall/tryleague-sessions/:id/assignments', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   const assignments = req.body;
 
@@ -1595,13 +1672,13 @@ app.put('/hall/trytryleague-sessions/:id/assignments', requireAuth, requireHallA
   }
 });
 
-// ── POST /hall/trytryleague-sessions/:id/matches ────────────────────────────────────
+// ── POST /hall/tryleague-sessions/:id/matches ────────────────────────────────────
 // Bulk-insert all matches for a session. Deletes existing matches first.
 // Also transitions session status → 'running' and sets started_at.
 // Body: { matches: [{ group_idx, side_id, round_num, is_rotate,
 //                     p1_id, p2_id, breaker_id }] }
 // Returns: { matches: [...rows with match_id in insertion order] }
-app.post('/hall/trytryleague-sessions/:id/matches', requireAuth, requireHallAdmin, async (req, res) => {
+app.post('/hall/tryleague-sessions/:id/matches', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   const { matches } = req.body;
 
@@ -1669,9 +1746,9 @@ app.post('/hall/trytryleague-sessions/:id/matches', requireAuth, requireHallAdmi
   }
 });
 
-// ── GET /hall/trytryleague-sessions/:id/matches ─────────────────────────────────────
+// ── GET /hall/tryleague-sessions/:id/matches ─────────────────────────────────────
 // Returns all matches for a session (needed for Phase 5 resume).
-app.get('/hall/trytryleague-sessions/:id/matches', requireAuth, requireHallAuth, async (req, res) => {
+app.get('/hall/tryleague-sessions/:id/matches', requireAuth, requireHallAuth, async (req, res) => {
   const { id } = req.params;
   try {
     const check = await pool.query(
@@ -1695,14 +1772,14 @@ app.get('/hall/trytryleague-sessions/:id/matches', requireAuth, requireHallAuth,
   }
 });
 
-// ── PUT /hall/trytryleague-sessions/:id/matches/:matchId ────────────────────────────
+// ── PUT /hall/tryleague-sessions/:id/matches/:matchId ────────────────────────────
 // Update a single match. Handles all transitions:
 //   pending → playing     (setPlaying): body { status: 'playing' }
 //   playing → done        (score submit): body { status:'done', score1, score2, winner_id }
 //   done    → done        (score edit): same as above
 //   done    → playing     (re-open): body { status: 'playing' }
 // finished_at is set on → done, cleared on → playing.
-app.put('/hall/trytryleague-sessions/:id/matches/:matchId', requireAuth, requireHallAdmin, async (req, res) => {
+app.put('/hall/tryleague-sessions/:id/matches/:matchId', requireAuth, requireHallAdmin, async (req, res) => {
   const { id, matchId } = req.params;
   const { status, score1, score2, winner_id } = req.body;
 
