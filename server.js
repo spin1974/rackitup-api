@@ -577,6 +577,46 @@ app.delete('/admin/db/tournaments/:id', requireAuth, requireSiteAdmin, async (re
   }
 });
 
+// ── GET /admin/db/tryleague-orphans ───────────────────────────────────────────
+app.get('/admin/db/tryleague-orphans', requireAuth, requireSiteAdmin, async (req, res) => {
+  const minDays = parseInt(req.query.min_age_days, 10);
+  if (isNaN(minDays) || minDays < 0) return res.status(400).json({ error: 'min_age_days must be a non-negative integer' });
+  try {
+    const result = await pool.query(`
+      SELECT s.session_id, s.name, s.status, s.created_at,
+             ph.poolhall_id, ph.poolhall_name, ph.city, ph.province_state,
+             EXTRACT(EPOCH FROM (NOW() - s.created_at)) / 86400 AS age_days,
+             (SELECT COUNT(*) FROM tryleague_session_players tsp WHERE tsp.session_id = s.session_id) AS player_count
+      FROM tryleague_sessions s JOIN poolhall ph ON ph.poolhall_id = s.poolhall_id
+      WHERE s.status IN ('setup', 'running')
+        AND s.created_at < NOW() - ($1 || ' days')::INTERVAL
+      ORDER BY s.created_at ASC
+    `, [minDays]);
+    res.json({ orphans: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /admin/db/tryleague-sessions/:id ───────────────────────────────────
+app.delete('/admin/db/tryleague-sessions/:id', requireAuth, requireSiteAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const check = await pool.query(
+      `SELECT s.session_id, s.name, s.status, s.created_at, ph.poolhall_name
+       FROM tryleague_sessions s JOIN poolhall ph ON ph.poolhall_id = s.poolhall_id
+       WHERE s.session_id = $1`, [id]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+    const s = check.rows[0];
+    await pool.query(`DELETE FROM tryleague_sessions WHERE session_id = $1`, [id]);
+    console.log(`[ADMIN DELETE] tryleague session_id=${s.session_id} name="${s.name}" hall="${s.poolhall_name}" status=${s.status} deleted_by=user_id:${req.user.user_id}`);
+    res.json({ deleted: true, session_id: s.session_id, name: s.name });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // HALL ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════════
