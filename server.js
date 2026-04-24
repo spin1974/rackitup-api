@@ -1162,7 +1162,7 @@ app.delete('/hall/tryleague-sessions/:id', requireAuth, requireHallAdmin, async 
       [id, req.hallId]
     );
     if (check.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
-    if (check.rows[0].status !== 'setup') return res.status(409).json({ error: 'Can only delete sessions in setup status' });
+    // No status restriction — hall_admin can hard-delete any session (cascades to players + matches)
     const result = await pool.query(
       `DELETE FROM tryleague_sessions WHERE session_id = $1 AND poolhall_id = $2 RETURNING session_id, name`,
       [id, req.hallId]
