@@ -1386,6 +1386,66 @@ app.put('/hall/tryleague-sessions/:id/matches/:matchId', requireAuth, requireHal
   }
 });
 
+// ── GET /public/tryleague-sessions/:id ───────────────────────────────────────
+// No auth required — returns session info, roster, and matches for read-only display.
+// Only exposes sessions with status 'running' or 'finished' (not 'setup').
+app.get('/public/tryleague-sessions/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    // Session — only running or finished sessions are publicly visible
+    const sessionResult = await pool.query(
+      `SELECT s.session_id, s.name, s.status, s.config, s.started_at, s.finished_at,
+              p.poolhall_name
+       FROM tryleague_sessions s
+       JOIN poolhall p ON s.poolhall_id = p.poolhall_id
+       WHERE s.session_id = $1 AND s.status IN ('running', 'finished')`,
+      [id]
+    );
+    if (sessionResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Session not found or not yet started' });
+    }
+    const session = sessionResult.rows[0];
+
+    // Roster with player details and group/side assignments
+    const rosterResult = await pool.query(
+      `SELECT lsp.player_id, lsp.side, lsp.group_name,
+              p.first_name, p.last_name, p.tier, p.hall_rating
+       FROM tryleague_session_players lsp
+       JOIN player p ON lsp.player_id = p.player_id
+       WHERE lsp.session_id = $1
+       ORDER BY lsp.group_name, lsp.side, p.first_name`,
+      [id]
+    );
+
+    // Matches with player names joined in
+    const matchResult = await pool.query(
+      `SELECT m.match_id, m.group_idx, m.side_id, m.round_num, m.is_rotate,
+              m.status, m.score1, m.score2, m.finished_at,
+              m.p1_id, m.p2_id, m.breaker_id, m.winner_id,
+              p1.first_name AS p1_first, p1.last_name AS p1_last,
+              p2.first_name AS p2_first, p2.last_name AS p2_last,
+              pb.first_name AS breaker_first,
+              pw.first_name AS winner_first, pw.last_name AS winner_last
+       FROM tryleague_matches m
+       JOIN player p1 ON m.p1_id = p1.player_id
+       JOIN player p2 ON m.p2_id = p2.player_id
+       LEFT JOIN player pb ON m.breaker_id = pb.player_id
+       LEFT JOIN player pw ON m.winner_id = pw.player_id
+       WHERE m.session_id = $1
+       ORDER BY m.group_idx, m.round_num, m.match_id`,
+      [id]
+    );
+
+    res.json({
+      session,
+      players: rosterResult.rows,
+      matches: matchResult.rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Rack It Up API running on port ${PORT}`);
