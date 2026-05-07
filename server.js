@@ -1446,6 +1446,93 @@ app.get('/public/tryleague-sessions/:id', async (req, res) => {
   }
 });
 
+// ── POST /public/tryleague-sessions/:id/verify-pin ───────────────────────────
+// No auth required. Validates captain PIN against session config.
+// Rate-limited via existing checkRateLimit(). Only accepts running sessions.
+app.post('/public/tryleague-sessions/:id/verify-pin', async (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(ip)) return res.status(429).json({ error: 'Too many requests' });
+
+  const { id } = req.params;
+  const { pin } = req.body;
+  if (!pin) return res.status(400).json({ error: 'pin is required' });
+
+  try {
+    const result = await pool.query(
+      `SELECT config FROM tryleague_sessions WHERE session_id = $1 AND status = 'running'`,
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Session not found or not running' });
+
+    const config = result.rows[0].config || {};
+    const storedPin = config.captain_pin;
+    if (!storedPin) return res.status(403).json({ error: 'No PIN set for this session' });
+
+    if (String(pin).trim() === String(storedPin).trim()) {
+      res.json({ valid: true });
+    } else {
+      res.status(403).json({ valid: false, error: 'Incorrect PIN' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /public/tryleague-sessions/:id/matches/:matchId ──────────────────────
+// No JWT required. PIN in request body acts as auth.
+// Captains may only set status 'done' — cannot re-open or reset matches.
+// Session must be 'running'. PIN must match config.captain_pin.
+app.put('/public/tryleague-sessions/:id/matches/:matchId', async (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(ip)) return res.status(429).json({ error: 'Too many requests' });
+
+  const { id, matchId } = req.params;
+  const { pin, score1, score2, winner_id } = req.body;
+  if (!pin) return res.status(400).json({ error: 'pin is required' });
+
+  try {
+    // Validate session is running and PIN matches
+    const sessionResult = await pool.query(
+      `SELECT config FROM tryleague_sessions WHERE session_id = $1 AND status = 'running'`,
+      [id]
+    );
+    if (sessionResult.rows.length === 0) return res.status(404).json({ error: 'Session not found or not running' });
+
+    const config = sessionResult.rows[0].config || {};
+    const storedPin = config.captain_pin;
+    if (!storedPin) return res.status(403).json({ error: 'No PIN set for this session' });
+    if (String(pin).trim() !== String(storedPin).trim()) return res.status(403).json({ error: 'Incorrect PIN' });
+
+    // Validate match belongs to this session
+    const matchCheck = await pool.query(
+      `SELECT match_id, status FROM tryleague_matches WHERE match_id = $1 AND session_id = $2`,
+      [matchId, id]
+    );
+    if (matchCheck.rows.length === 0) return res.status(404).json({ error: 'Match not found' });
+
+    // Validate scores: one must be 10–17 (winner), other 0–7 (loser), total = 17
+    const s1 = score1 != null ? parseInt(score1) : null;
+    const s2 = score2 != null ? parseInt(score2) : null;
+    if (s1 == null || s2 == null || isNaN(s1) || isNaN(s2)) return res.status(400).json({ error: 'score1 and score2 are required' });
+    if (s1 + s2 !== 17) return res.status(400).json({ error: 'Scores must total 17' });
+    const validPair = (s1 >= 10 && s2 <= 7) || (s2 >= 10 && s1 <= 7);
+    if (!validPair) return res.status(400).json({ error: 'Invalid scores — winner needs 10–17, loser 0–7' });
+    if (!winner_id) return res.status(400).json({ error: 'winner_id is required' });
+
+    const result = await pool.query(
+      `UPDATE tryleague_matches
+       SET status = 'done', score1 = $1, score2 = $2, winner_id = $3, finished_at = NOW()
+       WHERE match_id = $4 AND session_id = $5
+       RETURNING match_id, session_id, group_idx, round_num, is_rotate,
+                 p1_id, p2_id, winner_id, score1, score2, status, finished_at`,
+      [s1, s2, winner_id, matchId, id]
+    );
+    res.json({ match: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Rack It Up API running on port ${PORT}`);
