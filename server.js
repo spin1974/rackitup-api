@@ -1075,6 +1075,439 @@ app.put('/hall/chip-tournaments/:id/matches/:matchId', requireAuth, requireHallA
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ROUND ROBIN TOURNAMENT ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── GET /hall/roundrobin-tournaments ─────────────────────────────────────────
+app.get('/hall/roundrobin-tournaments', requireAuth, requireHallAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT t.tournament_id, t.name, t.status, t.config, t.created_at, t.updated_at,
+              COUNT(rtp.tournament_player_id)::int AS player_count
+       FROM roundrobin_tournaments t
+       LEFT JOIN roundrobin_tournament_players rtp ON rtp.tournament_id = t.tournament_id
+       WHERE t.poolhall_id = $1
+       GROUP BY t.tournament_id
+       ORDER BY t.created_at DESC`,
+      [req.hallId]
+    );
+    res.json({ tournaments: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/roundrobin-tournaments ────────────────────────────────────────
+app.post('/hall/roundrobin-tournaments', requireAuth, requireHallAdmin, async (req, res) => {
+  const { name, config } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Tournament name is required' });
+  try {
+    // Guard: only one active tournament at a time
+    const active = await pool.query(
+      `SELECT tournament_id FROM roundrobin_tournaments
+       WHERE poolhall_id = $1 AND status IN ('setup', 'running') LIMIT 1`,
+      [req.hallId]
+    );
+    if (active.rows.length > 0) {
+      return res.status(409).json({ error: 'A tournament is already active. Finish it before creating a new one.' });
+    }
+    const result = await pool.query(
+      `INSERT INTO roundrobin_tournaments (poolhall_id, name, status, config, created_at, updated_at)
+       VALUES ($1, $2, 'setup', $3, NOW(), NOW())
+       RETURNING tournament_id, poolhall_id, name, status, config, created_at, updated_at`,
+      [req.hallId, name.trim(), config ? JSON.stringify(config) : JSON.stringify({})]
+    );
+    res.status(201).json({ tournament: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/roundrobin-tournaments/:id ─────────────────────────────────────
+app.get('/hall/roundrobin-tournaments/:id', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const tResult = await pool.query(
+      `SELECT tournament_id, poolhall_id, name, status, config, created_at, updated_at
+       FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (tResult.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+
+    const pResult = await pool.query(
+      `SELECT rtp.tournament_player_id, rtp.player_id, rtp.group_idx, rtp.seed_rating, rtp.created_at,
+              p.first_name, p.last_name, p.hall_rating, p.fargo_rating, p.tier
+       FROM roundrobin_tournament_players rtp
+       JOIN player p ON p.player_id = rtp.player_id
+       WHERE rtp.tournament_id = $1
+       ORDER BY rtp.seed_rating DESC NULLS LAST, p.last_name`,
+      [id]
+    );
+
+    res.json({ tournament: tResult.rows[0], players: pResult.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/roundrobin-tournaments/:id ─────────────────────────────────────
+app.put('/hall/roundrobin-tournaments/:id', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { name, status, config } = req.body;
+  const validStatuses = ['setup', 'running', 'finished'];
+  if (status && !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE roundrobin_tournaments
+       SET name       = COALESCE($1, name),
+           status     = COALESCE($2, status),
+           config     = COALESCE($3, config),
+           updated_at = NOW()
+       WHERE tournament_id = $4 AND poolhall_id = $5
+       RETURNING tournament_id, poolhall_id, name, status, config, created_at, updated_at`,
+      [name || null, status || null, config ? JSON.stringify(config) : null, id, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    res.json({ tournament: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /hall/roundrobin-tournaments/:id ───────────────────────────────────
+app.delete('/hall/roundrobin-tournaments/:id', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `DELETE FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2
+       RETURNING tournament_id, name`,
+      [id, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    res.json({ message: 'Tournament deleted', tournament: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/roundrobin-tournaments/:id/players ─────────────────────────────
+app.post('/hall/roundrobin-tournaments/:id/players', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { player_id } = req.body;
+  if (!player_id) return res.status(400).json({ error: 'player_id is required' });
+  try {
+    const tCheck = await pool.query(
+      `SELECT tournament_id, status FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (tCheck.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    if (tCheck.rows[0].status === 'finished') return res.status(409).json({ error: 'Cannot add players to a finished tournament' });
+
+    const pCheck = await pool.query(
+      `SELECT player_id, hall_rating FROM player WHERE player_id = $1 AND poolhall_id = $2 AND deleted_at IS NULL`,
+      [player_id, req.hallId]
+    );
+    if (pCheck.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+
+    const seedRating = pCheck.rows[0].hall_rating || null;
+    const result = await pool.query(
+      `INSERT INTO roundrobin_tournament_players (tournament_id, player_id, seed_rating, created_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (tournament_id, player_id) DO NOTHING
+       RETURNING tournament_player_id, tournament_id, player_id, group_idx, seed_rating, created_at`,
+      [id, player_id, seedRating]
+    );
+    if (!result.rows.length) return res.status(409).json({ error: 'Player already registered' });
+    res.status(201).json({ player: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /hall/roundrobin-tournaments/:id/players/:pid ─────────────────────
+app.delete('/hall/roundrobin-tournaments/:id/players/:pid', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, pid } = req.params;
+  try {
+    const tCheck = await pool.query(
+      `SELECT tournament_id FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (tCheck.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    const result = await pool.query(
+      `DELETE FROM roundrobin_tournament_players WHERE tournament_id = $1 AND player_id = $2
+       RETURNING tournament_player_id, player_id`,
+      [id, pid]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Player not in tournament' });
+    res.json({ message: 'Player removed', player: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/roundrobin-tournaments/:id/schedule ────────────────────────────
+// Generates groups + full match schedule. Deletes any existing matches first.
+// Transitions tournament status → 'running'.
+// Body: { groups: 1|2|3, group_assignments: [{ player_id, group_idx }] }
+//   group_assignments is the admin-confirmed list after drag adjustment.
+//   If omitted, players are auto-split by seed_rating descending.
+app.post('/hall/roundrobin-tournaments/:id/schedule', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { groups: numGroups = 1, group_assignments } = req.body;
+
+  if (![1, 2, 3].includes(Number(numGroups))) {
+    return res.status(400).json({ error: 'groups must be 1, 2, or 3' });
+  }
+
+  try {
+    const tResult = await pool.query(
+      `SELECT tournament_id, poolhall_id, status, config
+       FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (tResult.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    if (tResult.rows[0].status === 'finished') return res.status(409).json({ error: 'Tournament is already finished' });
+
+    const cfg = tResult.rows[0].config || {};
+    const rounds          = Number(cfg.rounds)              || 5;
+    const matchesPerRound = Number(cfg.matches_per_opponent) || 3;
+
+    // Load registered players ordered by seed_rating desc
+    const pResult = await pool.query(
+      `SELECT rtp.player_id, rtp.seed_rating
+       FROM roundrobin_tournament_players rtp
+       WHERE rtp.tournament_id = $1
+       ORDER BY rtp.seed_rating DESC NULLS LAST`,
+      [id]
+    );
+    const allPlayers = pResult.rows;
+    if (allPlayers.length < 2) {
+      return res.status(400).json({ error: 'Need at least 2 players to generate a schedule' });
+    }
+
+    const N = Number(numGroups);
+
+    // ── Assign players to groups ──────────────────────────────────────────────
+    // Use provided assignments if supplied, otherwise auto-split by rating order
+    let groupMap = new Map(); // group_idx (0-based) → [player_id, ...]
+    for (let g = 0; g < N; g++) groupMap.set(g, []);
+
+    if (group_assignments && group_assignments.length) {
+      for (const a of group_assignments) {
+        const gi = Number(a.group_idx);
+        if (gi >= 0 && gi < N) groupMap.get(gi).push(Number(a.player_id));
+      }
+      // Any registered player missing from assignments falls into group 0
+      const assigned = new Set(group_assignments.map(a => Number(a.player_id)));
+      for (const p of allPlayers) {
+        if (!assigned.has(p.player_id)) groupMap.get(0).push(p.player_id);
+      }
+    } else {
+      // Auto-split: top N players per slice (snake draft would be overkill — simple split)
+      const perGroup = Math.ceil(allPlayers.length / N);
+      allPlayers.forEach((p, i) => {
+        const gi = Math.min(Math.floor(i / perGroup), N - 1);
+        groupMap.get(gi).push(p.player_id);
+      });
+    }
+
+    // ── Generate schedule per group ───────────────────────────────────────────
+    // For each group: randomly pair players each round with no repeat opponents.
+    // If odd players, one player gets a bye that round (rotated).
+    // Each pairing produces matchesPerRound individual match rows.
+    const matchRows = []; // { group_idx, round_num, match_num, p1_id, p2_id, is_bye }
+
+    for (const [gi, playerIds] of groupMap) {
+      if (!playerIds.length) continue;
+
+      // Build list of all required pairings: each player needs `rounds` opponents (no repeats)
+      // We use a round-by-round random shuffle approach with bye rotation for odd groups.
+      const hasBye   = playerIds.length % 2 === 1;
+      const poolSize = hasBye ? playerIds.length + 1 : playerIds.length; // pad with null for bye slot
+      const padded   = hasBye ? [...playerIds, null] : [...playerIds];
+
+      // Track which opponents each player has already faced to avoid repeats
+      const faced = new Map();
+      for (const pid of playerIds) faced.set(pid, new Set());
+
+      // Track bye rotation: who has had the fewest byes
+      const byeCount = new Map();
+      for (const pid of playerIds) byeCount.set(pid, 0);
+
+      for (let round = 1; round <= rounds; round++) {
+        // Attempt to build a valid pairing for this round (no repeats)
+        // Up to 20 shuffle attempts before accepting best available
+        let bestPairs = null;
+        let bestConflicts = Infinity;
+
+        for (let attempt = 0; attempt < 20; attempt++) {
+          // Shuffle player pool (keeping null at end for bye if needed)
+          const shuffled = [...playerIds].sort(() => Math.random() - 0.5);
+          if (hasBye) {
+            // Determine who gets the bye this round: player with fewest byes who hasn't faced bye yet
+            // (bye is tracked as facing null)
+            let byePlayer = null;
+            let minByes = Infinity;
+            for (const pid of shuffled) {
+              const bc = byeCount.get(pid) || 0;
+              if (bc < minByes) { minByes = bc; byePlayer = pid; }
+            }
+            // Move bye player to last position so they pair with the null slot
+            const idx = shuffled.indexOf(byePlayer);
+            shuffled.splice(idx, 1);
+            shuffled.push(byePlayer);
+          }
+
+          // Pair up: [0,1], [2,3], ...
+          const pairs = [];
+          for (let i = 0; i < shuffled.length; i += 2) {
+            pairs.push([shuffled[i], shuffled[i + 1] || null]);
+          }
+          if (hasBye) {
+            // Last pair has the bye player vs null — ensure it's the one we wanted
+            // Already guaranteed by how we moved byePlayer to end above
+          }
+
+          // Count conflicts (repeat opponents)
+          let conflicts = 0;
+          for (const [a, b] of pairs) {
+            if (a && b && faced.get(a)?.has(b)) conflicts++;
+          }
+          if (conflicts < bestConflicts) {
+            bestConflicts = conflicts;
+            bestPairs     = pairs;
+            if (conflicts === 0) break;
+          }
+        }
+
+        // Commit pairings
+        for (const [a, b] of bestPairs) {
+          if (!a) continue; // skip null-null (shouldn't happen)
+          const isBye = b === null;
+
+          // Track faced
+          if (!isBye) {
+            faced.get(a)?.add(b);
+            faced.get(b)?.add(a);
+          } else {
+            byeCount.set(a, (byeCount.get(a) || 0) + 1);
+          }
+
+          // Emit match rows: one per match_num (e.g. 3 rows for matchesPerRound=3)
+          for (let mn = 1; mn <= matchesPerRound; mn++) {
+            matchRows.push({
+              group_idx: gi,
+              round_num: round,
+              match_num: mn,
+              p1_id:     a,
+              p2_id:     isBye ? null : b,
+              is_bye:    isBye
+            });
+          }
+        }
+      }
+    }
+
+    // ── Persist in a transaction ──────────────────────────────────────────────
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Update group_idx on each player row
+      for (const [gi, playerIds] of groupMap) {
+        if (!playerIds.length) continue;
+        await client.query(
+          `UPDATE roundrobin_tournament_players SET group_idx = $1
+           WHERE tournament_id = $2 AND player_id = ANY($3::int[])`,
+          [gi, id, playerIds]
+        );
+      }
+
+      // Delete any previously generated matches
+      await client.query(`DELETE FROM roundrobin_matches WHERE tournament_id = $1`, [id]);
+
+      // Bulk insert matches
+      for (const m of matchRows) {
+        await client.query(
+          `INSERT INTO roundrobin_matches
+             (tournament_id, group_idx, round_num, match_num, p1_id, p2_id, is_bye, status, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NOW(), NOW())`,
+          [id, m.group_idx, m.round_num, m.match_num, m.p1_id, m.p2_id || null, m.is_bye]
+        );
+      }
+
+      // Transition to running
+      await client.query(
+        `UPDATE roundrobin_tournaments SET status = 'running', updated_at = NOW() WHERE tournament_id = $1`,
+        [id]
+      );
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    // Return the matches with player names joined
+    const matchResult = await pool.query(
+      `SELECT m.match_id, m.group_idx, m.round_num, m.match_num,
+              m.p1_id, m.p2_id, m.is_bye, m.status,
+              p1.first_name AS p1_first, p1.last_name AS p1_last,
+              p1.hall_rating AS p1_rating,
+              p2.first_name AS p2_first, p2.last_name AS p2_last,
+              p2.hall_rating AS p2_rating
+       FROM roundrobin_matches m
+       JOIN player p1 ON m.p1_id = p1.player_id
+       LEFT JOIN player p2 ON m.p2_id = p2.player_id
+       WHERE m.tournament_id = $1
+       ORDER BY m.group_idx, m.round_num, m.match_id`,
+      [id]
+    );
+
+    res.status(201).json({
+      message: `Schedule generated: ${matchRows.length} match rows across ${N} group(s)`,
+      matches: matchResult.rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/roundrobin-tournaments/:id/matches ──────────────────────────────
+app.get('/hall/roundrobin-tournaments/:id/matches', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const tCheck = await pool.query(
+      `SELECT tournament_id FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (tCheck.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+
+    const result = await pool.query(
+      `SELECT m.match_id, m.group_idx, m.round_num, m.match_num,
+              m.p1_id, m.p2_id, m.is_bye, m.status, m.winner_id, m.score1, m.score2,
+              p1.first_name AS p1_first, p1.last_name AS p1_last,
+              p1.hall_rating AS p1_rating,
+              p2.first_name AS p2_first, p2.last_name AS p2_last,
+              p2.hall_rating AS p2_rating
+       FROM roundrobin_matches m
+       JOIN player p1 ON m.p1_id = p1.player_id
+       LEFT JOIN player p2 ON m.p2_id = p2.player_id
+       WHERE m.tournament_id = $1
+       ORDER BY m.group_idx, m.round_num, m.match_id`,
+      [id]
+    );
+    res.json({ matches: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // TRY LEAGUE SESSION ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
