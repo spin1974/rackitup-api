@@ -1250,12 +1250,18 @@ app.delete('/hall/roundrobin-tournaments/:id/players/:pid', requireAuth, require
 // ── POST /hall/roundrobin-tournaments/:id/schedule ────────────────────────────
 // Generates groups + full match schedule. Deletes any existing matches first.
 // Transitions tournament status → 'running'.
-// Body: { groups: 1|2|3, group_assignments: [{ player_id, group_idx }] }
+// Body: {
+//   groups: 1|2|3,
+//   group_assignments: [{ player_id, group_idx }],
+//   group_config: [{ group_idx, rounds, matches_per_opponent }]  ← optional, per-group overrides
+// }
 //   group_assignments is the admin-confirmed list after drag adjustment.
 //   If omitted, players are auto-split by seed_rating descending.
+//   group_config overrides the tournament-level rounds/matches_per_opponent per group.
+//   Falls back to tournament config values if group_config is omitted or incomplete.
 app.post('/hall/roundrobin-tournaments/:id/schedule', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
-  const { groups: numGroups = 1, group_assignments } = req.body;
+  const { groups: numGroups = 1, group_assignments, group_config } = req.body;
 
   if (![1, 2, 3].includes(Number(numGroups))) {
     return res.status(400).json({ error: 'groups must be 1, 2, or 3' });
@@ -1271,8 +1277,20 @@ app.post('/hall/roundrobin-tournaments/:id/schedule', requireAuth, requireHallAd
     if (tResult.rows[0].status === 'finished') return res.status(409).json({ error: 'Tournament is already finished' });
 
     const cfg = tResult.rows[0].config || {};
-    const rounds          = Number(cfg.rounds)              || 5;
-    const matchesPerRound = Number(cfg.matches_per_opponent) || 3;
+    const defaultRounds = Number(cfg.rounds)              || 5;
+    const defaultMpo    = Number(cfg.matches_per_opponent) || 3;
+
+    // Build per-group config map: group_idx → { rounds, matchesPerRound }
+    // Seeded from group_config body param; falls back to tournament config defaults
+    const groupCfgMap = new Map();
+    if (Array.isArray(group_config)) {
+      for (const gc of group_config) {
+        groupCfgMap.set(Number(gc.group_idx), {
+          rounds:          Number(gc.rounds)               || defaultRounds,
+          matchesPerRound: Number(gc.matches_per_opponent) || defaultMpo
+        });
+      }
+    }
 
     // Load registered players ordered by seed_rating desc
     const pResult = await pool.query(
@@ -1321,6 +1339,11 @@ app.post('/hall/roundrobin-tournaments/:id/schedule', requireAuth, requireHallAd
 
     for (const [gi, playerIds] of groupMap) {
       if (!playerIds.length) continue;
+
+      // Per-group config, falling back to tournament defaults
+      const gcfg          = groupCfgMap.get(gi) || {};
+      const rounds          = gcfg.rounds          || defaultRounds;
+      const matchesPerRound = gcfg.matchesPerRound || defaultMpo;
 
       // Build list of all required pairings: each player needs `rounds` opponents (no repeats)
       // We use a round-by-round random shuffle approach with bye rotation for odd groups.
