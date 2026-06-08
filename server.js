@@ -1595,46 +1595,7 @@ app.put('/hall/tryleague-sessions/:id', requireAuth, requireHallAdmin, async (re
          started_at, finished_at, id, req.hallId]
       );
       if (status === 'finished' && !wasAlreadyFinished) {
-        const matches = await client.query(
-          `SELECT p1_id, p2_id, winner_id FROM tryleague_matches
-           WHERE session_id = $1 AND is_rotate = FALSE AND status = 'done' AND winner_id IS NOT NULL`,
-          [id]
-        );
-        const statsMap = new Map();
-        for (const m of matches.rows) {
-          const loserId = m.winner_id === m.p1_id ? m.p2_id : m.p1_id;
-          const winnerId = m.winner_id;
-          if (!statsMap.has(winnerId)) statsMap.set(winnerId, { wins: 0, losses: 0 });
-          if (!statsMap.has(loserId))  statsMap.set(loserId,  { wins: 0, losses: 0 });
-          statsMap.get(winnerId).wins  += 1;
-          statsMap.get(loserId).losses += 1;
-        }
-        for (const [playerId, delta] of statsMap.entries()) {
-          await client.query(
-            `INSERT INTO tryleague_player_stats (player_id, poolhall_id, sessions_played, total_wins, total_losses, last_played_at)
-             VALUES ($1, $2, 1, $3, $4, NOW())
-             ON CONFLICT (player_id, poolhall_id) DO UPDATE SET
-               sessions_played = tryleague_player_stats.sessions_played + 1,
-               total_wins      = tryleague_player_stats.total_wins      + EXCLUDED.total_wins,
-               total_losses    = tryleague_player_stats.total_losses    + EXCLUDED.total_losses,
-               last_played_at  = NOW()`,
-            [playerId, req.hallId, delta.wins, delta.losses]
-          );
-        }
-        const allRoster = await client.query(`SELECT player_id FROM tryleague_session_players WHERE session_id = $1`, [id]);
-        for (const rp of allRoster.rows) {
-          if (!statsMap.has(rp.player_id)) {
-            await client.query(
-              `INSERT INTO tryleague_player_stats (player_id, poolhall_id, sessions_played, total_wins, total_losses, last_played_at)
-               VALUES ($1, $2, 1, 0, 0, NOW())
-               ON CONFLICT (player_id, poolhall_id) DO UPDATE SET
-                 sessions_played = tryleague_player_stats.sessions_played + 1,
-                 last_played_at  = NOW()`,
-              [rp.player_id, req.hallId]
-            );
-          }
-        }
-        console.log(`Session ${id} finished: stats upserted for ${statsMap.size} players, ${allRoster.rows.length} total roster`);
+        await upsertTryLeagueStats(client, id, row.poolhall_id);
       }
       await client.query('COMMIT');
       res.json({ session: result.rows[0] });
@@ -1984,6 +1945,220 @@ app.put('/public/tryleague-sessions/:id/matches/:matchId', async (req, res) => {
       [s1, s2, winner_id, matchId, id]
     );
     res.json({ match: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Shared helper: finish a Try League session and upsert lifetime stats ──────
+// PRE-REQUISITE MIGRATION (run once before deploying):
+//   ALTER TABLE tryleague_player_stats ADD COLUMN IF NOT EXISTS total_points INT DEFAULT 0;
+//
+// BACKFILL (run once after migration to populate historical data):
+//   UPDATE tryleague_player_stats tps
+//   SET total_points = sub.pts
+//   FROM (
+//     SELECT
+//       CASE WHEN m.winner_id = m.p1_id THEN m.p1_id ELSE m.p2_id END AS player_id,
+//       sp.poolhall_id,
+//       SUM(CASE WHEN m.p1_id = CASE WHEN m.winner_id = m.p1_id THEN m.p1_id ELSE m.p2_id END
+//                THEN m.score1 ELSE m.score2 END) AS pts
+//     FROM tryleague_matches m
+//     JOIN tryleague_session_players sp
+//       ON sp.session_id = m.session_id
+//      AND sp.player_id = CASE WHEN m.winner_id = m.p1_id THEN m.p1_id ELSE m.p2_id END
+//     WHERE m.status = 'done'
+//       AND m.score1 IS NOT NULL
+//       AND NOT (m.is_rotate = TRUE AND m.p2_id = CASE WHEN m.winner_id = m.p1_id THEN m.p1_id ELSE m.p2_id END)
+//     GROUP BY CASE WHEN m.winner_id = m.p1_id THEN m.p1_id ELSE m.p2_id END, sp.poolhall_id
+//   ) sub
+//   WHERE tps.player_id = sub.player_id AND tps.poolhall_id = sub.poolhall_id;
+//
+// Accepts a pg client (for transaction support), sessionId, and poolhallId.
+async function upsertTryLeagueStats(client, sessionId, poolhallId) {
+  // Fetch all scored matches for this session.
+  // For rotate matches: count p1 (Alpha/large-side player) but NOT p2 (the rotate double).
+  // is_rotate=true means p2 is the Beta player playing their second game — exclude their W/L/pts.
+  // p1 on a rotate match is always the Alpha large-side player with no normal match that round — always count them.
+  const matches = await client.query(
+    `SELECT p1_id, p2_id, winner_id, is_rotate, score1, score2
+     FROM tryleague_matches
+     WHERE session_id = $1 AND status = 'done' AND winner_id IS NOT NULL AND score1 IS NOT NULL`,
+    [sessionId]
+  );
+
+  const statsMap = new Map(); // player_id → { wins, losses, points }
+
+  const ensure = (id) => {
+    if (!statsMap.has(id)) statsMap.set(id, { wins: 0, losses: 0, points: 0 });
+  };
+
+  for (const m of matches.rows) {
+    const winnerId = m.winner_id;
+    const loserId  = m.winner_id === m.p1_id ? m.p2_id : m.p1_id;
+    const winScore = m.winner_id === m.p1_id ? m.score1 : m.score2;
+    const loseScore = m.winner_id === m.p1_id ? m.score2 : m.score1;
+
+    if (m.is_rotate) {
+      // Only count the Alpha/large-side player (p1). p2 is the Beta rotate double — skip their stats.
+      const alphaId = m.p1_id;
+      const alphaWon = m.winner_id === m.p1_id;
+      const alphaScore = alphaWon ? winScore : loseScore;
+      ensure(alphaId);
+      if (alphaWon) statsMap.get(alphaId).wins   += 1;
+      else          statsMap.get(alphaId).losses  += 1;
+      statsMap.get(alphaId).points += alphaScore;
+    } else {
+      ensure(winnerId);
+      ensure(loserId);
+      statsMap.get(winnerId).wins   += 1;
+      statsMap.get(winnerId).points += winScore;
+      statsMap.get(loserId).losses  += 1;
+      statsMap.get(loserId).points  += loseScore;
+    }
+  }
+
+  for (const [playerId, delta] of statsMap.entries()) {
+    await client.query(
+      `INSERT INTO tryleague_player_stats (player_id, poolhall_id, sessions_played, total_wins, total_losses, total_points, last_played_at)
+       VALUES ($1, $2, 1, $3, $4, $5, NOW())
+       ON CONFLICT (player_id, poolhall_id) DO UPDATE SET
+         sessions_played = tryleague_player_stats.sessions_played + 1,
+         total_wins      = tryleague_player_stats.total_wins      + EXCLUDED.total_wins,
+         total_losses    = tryleague_player_stats.total_losses    + EXCLUDED.total_losses,
+         total_points    = tryleague_player_stats.total_points    + EXCLUDED.total_points,
+         last_played_at  = NOW()`,
+      [playerId, poolhallId, delta.wins, delta.losses, delta.points]
+    );
+  }
+
+  // Ensure every roster player gets a sessions_played increment even if they had no scored matches
+  const allRoster = await client.query(
+    `SELECT player_id FROM tryleague_session_players WHERE session_id = $1`, [sessionId]
+  );
+  for (const rp of allRoster.rows) {
+    if (!statsMap.has(rp.player_id)) {
+      await client.query(
+        `INSERT INTO tryleague_player_stats (player_id, poolhall_id, sessions_played, total_wins, total_losses, total_points, last_played_at)
+         VALUES ($1, $2, 1, 0, 0, 0, NOW())
+         ON CONFLICT (player_id, poolhall_id) DO UPDATE SET
+           sessions_played = tryleague_player_stats.sessions_played + 1,
+           last_played_at  = NOW()`,
+        [rp.player_id, poolhallId]
+      );
+    }
+  }
+
+  console.log(`Session ${sessionId} finished: stats upserted for ${statsMap.size} players, ${allRoster.rows.length} total roster`);
+}
+
+// ── PUT /public/tryleague-sessions/:id/finish ─────────────────────────────────
+// No JWT required. PIN in request body acts as auth.
+// Validates all non-rotate matches are done, then marks session finished and upserts stats.
+// Idempotent: if already finished returns 200 with no side-effects.
+app.put('/public/tryleague-sessions/:id/finish', async (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(ip)) return res.status(429).json({ error: 'Too many requests' });
+
+  const { id } = req.params;
+  const { pin } = req.body;
+  if (!pin) return res.status(400).json({ error: 'pin is required' });
+
+  try {
+    const sessionResult = await pool.query(
+      `SELECT session_id, status, config, poolhall_id, started_at, finished_at
+       FROM tryleague_sessions WHERE session_id = $1`,
+      [id]
+    );
+    if (sessionResult.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+
+    const session = sessionResult.rows[0];
+
+    // Idempotent — already finished
+    if (session.status === 'finished') return res.json({ session });
+
+    if (session.status !== 'running') return res.status(409).json({ error: 'Session is not running' });
+
+    const config = session.config || {};
+    const storedPin = config.captain_pin;
+    if (!storedPin) return res.status(403).json({ error: 'No PIN set for this session' });
+    if (String(pin).trim() !== String(storedPin).trim()) return res.status(403).json({ error: 'Incorrect PIN' });
+
+    // Verify all non-rotate matches are done
+    const pendingCheck = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM tryleague_matches
+       WHERE session_id = $1 AND is_rotate = FALSE AND status != 'done'`,
+      [id]
+    );
+    if (parseInt(pendingCheck.rows[0].cnt) > 0) {
+      return res.status(409).json({ error: 'Not all matches are complete' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const finished_at = new Date();
+      const result = await client.query(
+        `UPDATE tryleague_sessions SET status = 'finished', finished_at = $1
+         WHERE session_id = $2
+         RETURNING session_id, poolhall_id, name, status, config, created_at, started_at, finished_at`,
+        [finished_at, id]
+      );
+      await upsertTryLeagueStats(client, id, session.poolhall_id);
+      await client.query('COMMIT');
+      res.json({ session: result.rows[0] });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /public/poolhalls/:publicId/tl-player-stats ───────────────────────────
+// No auth required. Returns lifetime Try League stats for all players at a hall.
+// Identified by the hall's public_id (opaque 12-char token, not the internal poolhall_id).
+app.get('/public/poolhalls/:publicId/tl-player-stats', async (req, res) => {
+  const { publicId } = req.params;
+  try {
+    const hallResult = await pool.query(
+      `SELECT poolhall_id, poolhall_name FROM poolhall WHERE public_id = $1`,
+      [publicId]
+    );
+    if (hallResult.rows.length === 0) return res.status(404).json({ error: 'Hall not found' });
+
+    const { poolhall_id, poolhall_name } = hallResult.rows[0];
+
+    const result = await pool.query(
+      `SELECT
+         p.player_id,
+         p.first_name,
+         p.last_name,
+         p.tier,
+         p.fargo_rating,
+         p.hall_rating,
+         COALESCE(s.sessions_played, 0) AS sessions_played,
+         COALESCE(s.total_wins,      0) AS total_wins,
+         COALESCE(s.total_losses,    0) AS total_losses,
+         COALESCE(s.total_points,    0) AS total_points,
+         s.last_played_at
+       FROM player p
+       LEFT JOIN tryleague_player_stats s
+         ON s.player_id = p.player_id AND s.poolhall_id = $1
+       WHERE p.poolhall_id = $1
+         AND p.deleted_at IS NULL
+         AND (s.sessions_played > 0 OR s.player_id IS NOT NULL)
+       ORDER BY s.total_wins DESC NULLS LAST, p.last_name, p.first_name`,
+      [poolhall_id]
+    );
+
+    res.json({
+      poolhall_name,
+      players: result.rows
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
