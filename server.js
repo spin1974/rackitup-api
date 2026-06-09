@@ -617,6 +617,23 @@ app.delete('/admin/db/tryleague-sessions/:id', requireAuth, requireSiteAdmin, as
   }
 });
 
+// ── GET /admin/roles ──────────────────────────────────────────────────────────
+// Returns all assignable roles for user management dropdowns.
+// team_captain is excluded — captain accounts are created via QR onboarding (Phase 4),
+// not manually by admins.
+app.get('/admin/roles', requireAuth, requireSiteAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT role_id, role_name FROM role
+       WHERE role_name != 'team_captain'
+       ORDER BY role_id ASC`
+    );
+    res.json({ roles: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // HALL ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════════
