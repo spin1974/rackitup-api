@@ -1531,6 +1531,449 @@ app.get('/hall/roundrobin-tournaments/:id/matches', requireAuth, requireHallAuth
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// LEAGUE ENDPOINTS (Phase 1 — league CRUD + teams + roster)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── GET /hall/leagues ─────────────────────────────────────────────────────────
+// List all leagues for this hall, with team count included.
+app.get('/hall/leagues', requireAuth, requireHallAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT l.id, l.name, l.season_label, l.status, l.playing_day,
+              l.start_date, l.end_date, l.num_weeks,
+              l.players_per_team, l.matches_per_night,
+              l.has_playoffs, l.playoff_format,
+              l.created_at, l.updated_at,
+              COUNT(t.id)::int AS team_count
+       FROM leagues l
+       LEFT JOIN teams t ON t.league_id = l.id
+       WHERE l.poolhall_id = $1
+       GROUP BY l.id
+       ORDER BY l.created_at DESC`,
+      [req.hallId]
+    );
+    res.json({ leagues: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/leagues ────────────────────────────────────────────────────────
+// Create a new league. Body contains all config fields from the setup wizard.
+app.post('/hall/leagues', requireAuth, requireHallAdmin, async (req, res) => {
+  const {
+    name, season_label, playing_day, start_date, end_date, num_weeks,
+    custom_dates, skip_dates, players_per_team, matches_per_night,
+    preferred_rating_type, rating_enforcement, win_condition,
+    tiebreaker_order, bye_handling, has_playoffs, playoff_format,
+    leaderboard_default, player_lb_default
+  } = req.body;
+
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: 'League name is required' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO leagues (
+         poolhall_id, name, season_label, status, playing_day,
+         start_date, end_date, num_weeks, custom_dates, skip_dates,
+         players_per_team, matches_per_night, preferred_rating_type,
+         rating_enforcement, win_condition, tiebreaker_order,
+         bye_handling, has_playoffs, playoff_format,
+         leaderboard_default, player_lb_default,
+         created_at, updated_at, created_by
+       ) VALUES (
+         $1,$2,$3,'draft',$4,
+         $5,$6,$7,$8,$9,
+         $10,$11,$12,
+         $13,$14,$15,
+         $16,$17,$18,
+         $19,$20,
+         NOW(),NOW(),$21
+       )
+       RETURNING *`,
+      [
+        req.hallId,
+        name.trim(),
+        season_label || null,
+        playing_day || null,
+        start_date || null,
+        end_date || null,
+        num_weeks || null,
+        custom_dates ? JSON.stringify(custom_dates) : null,
+        skip_dates ? JSON.stringify(skip_dates) : null,
+        players_per_team || 5,
+        matches_per_night || 5,
+        preferred_rating_type || 'rating',
+        rating_enforcement || 'warn',
+        win_condition || 'games_won',
+        tiebreaker_order ? JSON.stringify(tiebreaker_order) : JSON.stringify(['wins','points','head_to_head','playoff']),
+        bye_handling || 'no_points',
+        has_playoffs === true || has_playoffs === 'true' ? true : false,
+        playoff_format || null,
+        leaderboard_default || 'wins',
+        player_lb_default || 'wins',
+        req.user.user_id
+      ]
+    );
+    res.status(201).json({ league: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/leagues/:id ─────────────────────────────────────────────────────
+// Fetch a single league with its teams and each team's player count.
+app.get('/hall/leagues/:id', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const leagueResult = await pool.query(
+      `SELECT * FROM leagues WHERE id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (leagueResult.rows.length === 0) return res.status(404).json({ error: 'League not found' });
+
+    const teamsResult = await pool.query(
+      `SELECT t.id, t.name, t.status, t.captain_user_id, t.backup_captain_id,
+              t.created_at, t.updated_at,
+              COUNT(tp.id)::int AS player_count
+       FROM teams t
+       LEFT JOIN team_players tp ON tp.team_id = t.id AND tp.left_date IS NULL
+       WHERE t.league_id = $1
+       GROUP BY t.id
+       ORDER BY t.created_at ASC`,
+      [id]
+    );
+
+    res.json({ league: leagueResult.rows[0], teams: teamsResult.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/leagues/:id ─────────────────────────────────────────────────────
+// Update league config or status. Draft → active transition allowed here.
+app.put('/hall/leagues/:id', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const {
+    name, season_label, status, playing_day, start_date, end_date, num_weeks,
+    custom_dates, skip_dates, players_per_team, matches_per_night,
+    preferred_rating_type, rating_enforcement, win_condition,
+    tiebreaker_order, bye_handling, has_playoffs, playoff_format,
+    leaderboard_default, player_lb_default
+  } = req.body;
+
+  const validStatuses = ['draft', 'active', 'completed', 'archived'];
+  if (status && !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+  }
+
+  try {
+    const check = await pool.query(
+      `SELECT id FROM leagues WHERE id = $1 AND poolhall_id = $2`, [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'League not found' });
+
+    const result = await pool.query(
+      `UPDATE leagues SET
+         name                  = COALESCE($1,  name),
+         season_label          = COALESCE($2,  season_label),
+         status                = COALESCE($3,  status),
+         playing_day           = COALESCE($4,  playing_day),
+         start_date            = COALESCE($5,  start_date),
+         end_date              = COALESCE($6,  end_date),
+         num_weeks             = COALESCE($7,  num_weeks),
+         custom_dates          = COALESCE($8,  custom_dates),
+         skip_dates            = COALESCE($9,  skip_dates),
+         players_per_team      = COALESCE($10, players_per_team),
+         matches_per_night     = COALESCE($11, matches_per_night),
+         preferred_rating_type = COALESCE($12, preferred_rating_type),
+         rating_enforcement    = COALESCE($13, rating_enforcement),
+         win_condition         = COALESCE($14, win_condition),
+         tiebreaker_order      = COALESCE($15, tiebreaker_order),
+         bye_handling          = COALESCE($16, bye_handling),
+         has_playoffs          = COALESCE($17, has_playoffs),
+         playoff_format        = COALESCE($18, playoff_format),
+         leaderboard_default   = COALESCE($19, leaderboard_default),
+         player_lb_default     = COALESCE($20, player_lb_default),
+         updated_at            = NOW()
+       WHERE id = $21 AND poolhall_id = $22
+       RETURNING *`,
+      [
+        name || null, season_label || null, status || null, playing_day || null,
+        start_date || null, end_date || null, num_weeks || null,
+        custom_dates ? JSON.stringify(custom_dates) : null,
+        skip_dates ? JSON.stringify(skip_dates) : null,
+        players_per_team || null, matches_per_night || null,
+        preferred_rating_type || null, rating_enforcement || null,
+        win_condition || null,
+        tiebreaker_order ? JSON.stringify(tiebreaker_order) : null,
+        bye_handling || null,
+        has_playoffs != null ? has_playoffs : null,
+        playoff_format || null,
+        leaderboard_default || null, player_lb_default || null,
+        id, req.hallId
+      ]
+    );
+    res.json({ league: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /hall/leagues/:id ──────────────────────────────────────────────────
+// Hard delete — only permitted on draft leagues (not active/completed/archived).
+app.delete('/hall/leagues/:id', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const check = await pool.query(
+      `SELECT id, name, status FROM leagues WHERE id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'League not found' });
+    if (check.rows[0].status !== 'draft') {
+      return res.status(409).json({ error: 'Only draft leagues can be deleted' });
+    }
+    await pool.query(`DELETE FROM leagues WHERE id = $1`, [id]);
+    console.log(`[LEAGUE DELETE] id=${id} name="${check.rows[0].name}" poolhall_id=${req.hallId} deleted_by=user_id:${req.user.user_id}`);
+    res.json({ deleted: true, id: parseInt(id), name: check.rows[0].name });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/leagues/:id/teams ───────────────────────────────────────────────
+// List teams for a league, with current roster player count.
+app.get('/hall/leagues/:id/teams', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const leagueCheck = await pool.query(
+      `SELECT id FROM leagues WHERE id = $1 AND poolhall_id = $2`, [id, req.hallId]
+    );
+    if (leagueCheck.rows.length === 0) return res.status(404).json({ error: 'League not found' });
+
+    const result = await pool.query(
+      `SELECT t.id, t.name, t.status, t.captain_user_id, t.backup_captain_id,
+              t.created_at, t.updated_at,
+              COUNT(tp.id)::int AS player_count
+       FROM teams t
+       LEFT JOIN team_players tp ON tp.team_id = t.id AND tp.left_date IS NULL
+       WHERE t.league_id = $1
+       GROUP BY t.id
+       ORDER BY t.created_at ASC`,
+      [id]
+    );
+    res.json({ teams: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/leagues/:id/teams ──────────────────────────────────────────────
+// Create a team within a league.
+app.post('/hall/leagues/:id/teams', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { name, captain_user_id, backup_captain_id } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Team name is required' });
+
+  try {
+    const leagueCheck = await pool.query(
+      `SELECT id, status FROM leagues WHERE id = $1 AND poolhall_id = $2`, [id, req.hallId]
+    );
+    if (leagueCheck.rows.length === 0) return res.status(404).json({ error: 'League not found' });
+    if (leagueCheck.rows[0].status === 'archived') {
+      return res.status(409).json({ error: 'Cannot add teams to an archived league' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO teams (league_id, poolhall_id, name, status, captain_user_id, backup_captain_id, created_at, updated_at)
+       VALUES ($1, $2, $3, 'active', $4, $5, NOW(), NOW())
+       RETURNING id, league_id, name, status, captain_user_id, backup_captain_id, created_at, updated_at`,
+      [id, req.hallId, name.trim(), captain_user_id || null, backup_captain_id || null]
+    );
+    res.status(201).json({ team: result.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'A team with that name already exists in this league' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/leagues/:id/teams/:teamId ───────────────────────────────────────
+// Update team name, status, or captain assignments.
+app.put('/hall/leagues/:id/teams/:teamId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, teamId } = req.params;
+  const { name, status, captain_user_id, backup_captain_id } = req.body;
+  const validStatuses = ['active', 'withdrawn'];
+  if (status && !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+  }
+
+  try {
+    const check = await pool.query(
+      `SELECT t.id FROM teams t
+       JOIN leagues l ON l.id = t.league_id
+       WHERE t.id = $1 AND t.league_id = $2 AND l.poolhall_id = $3`,
+      [teamId, id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
+
+    const result = await pool.query(
+      `UPDATE teams SET
+         name              = COALESCE($1, name),
+         status            = COALESCE($2, status),
+         captain_user_id   = COALESCE($3, captain_user_id),
+         backup_captain_id = COALESCE($4, backup_captain_id),
+         updated_at        = NOW()
+       WHERE id = $5
+       RETURNING id, league_id, name, status, captain_user_id, backup_captain_id, updated_at`,
+      [name || null, status || null, captain_user_id || null, backup_captain_id || null, teamId]
+    );
+    res.json({ team: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /hall/leagues/:id/teams/:teamId ────────────────────────────────────
+// Remove a team. Only permitted on draft leagues; cascades to team_players.
+app.delete('/hall/leagues/:id/teams/:teamId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, teamId } = req.params;
+  try {
+    const leagueCheck = await pool.query(
+      `SELECT status FROM leagues WHERE id = $1 AND poolhall_id = $2`, [id, req.hallId]
+    );
+    if (leagueCheck.rows.length === 0) return res.status(404).json({ error: 'League not found' });
+    if (leagueCheck.rows[0].status !== 'draft') {
+      return res.status(409).json({ error: 'Teams can only be removed from draft leagues' });
+    }
+
+    const result = await pool.query(
+      `DELETE FROM teams WHERE id = $1 AND league_id = $2 RETURNING id, name`,
+      [teamId, id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
+    res.json({ deleted: true, team: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/leagues/:id/teams/:teamId/players ───────────────────────────────
+// Fetch the current roster for a team (left_date IS NULL = active members).
+app.get('/hall/leagues/:id/teams/:teamId/players', requireAuth, requireHallAuth, async (req, res) => {
+  const { id, teamId } = req.params;
+  try {
+    const check = await pool.query(
+      `SELECT t.id FROM teams t
+       JOIN leagues l ON l.id = t.league_id
+       WHERE t.id = $1 AND t.league_id = $2 AND l.poolhall_id = $3`,
+      [teamId, id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
+
+    const result = await pool.query(
+      `SELECT tp.id, tp.player_id, tp.role, tp.joined_date,
+              p.first_name, p.last_name, p.hall_rating, p.fargo_rating, p.tier
+       FROM team_players tp
+       JOIN player p ON p.player_id = tp.player_id
+       WHERE tp.team_id = $1 AND tp.left_date IS NULL
+       ORDER BY tp.role DESC, p.last_name, p.first_name`,
+      [teamId]
+    );
+    res.json({ players: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /hall/leagues/:id/teams/:teamId/players ──────────────────────────────
+// Add a player to a team roster. Validates:
+//   - Player belongs to this hall
+//   - Player is not already on another team in the same league
+app.post('/hall/leagues/:id/teams/:teamId/players', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, teamId } = req.params;
+  const { player_id, role } = req.body;
+  if (!player_id) return res.status(400).json({ error: 'player_id is required' });
+  const validRoles = ['regular', 'sub'];
+  const playerRole = role || 'regular';
+  if (!validRoles.includes(playerRole)) {
+    return res.status(400).json({ error: `role must be one of: ${validRoles.join(', ')}` });
+  }
+
+  try {
+    // Verify team exists in this hall's league
+    const teamCheck = await pool.query(
+      `SELECT t.id FROM teams t
+       JOIN leagues l ON l.id = t.league_id
+       WHERE t.id = $1 AND t.league_id = $2 AND l.poolhall_id = $3`,
+      [teamId, id, req.hallId]
+    );
+    if (teamCheck.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
+
+    // Verify player belongs to this hall
+    const playerCheck = await pool.query(
+      `SELECT player_id FROM player WHERE player_id = $1 AND poolhall_id = $2 AND deleted_at IS NULL`,
+      [player_id, req.hallId]
+    );
+    if (playerCheck.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+
+    // Check player is not already on a different team in the same league
+    const conflictCheck = await pool.query(
+      `SELECT tp.id, t.name AS team_name
+       FROM team_players tp
+       JOIN teams t ON t.id = tp.team_id
+       WHERE t.league_id = $1 AND tp.player_id = $2 AND tp.left_date IS NULL AND tp.team_id != $3`,
+      [id, player_id, teamId]
+    );
+    if (conflictCheck.rows.length > 0) {
+      return res.status(409).json({
+        error: `Player is already on team "${conflictCheck.rows[0].team_name}" in this league`
+      });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO team_players (team_id, player_id, role, joined_date)
+       VALUES ($1, $2, $3, CURRENT_DATE)
+       ON CONFLICT (team_id, player_id) DO NOTHING
+       RETURNING id, team_id, player_id, role, joined_date`,
+      [teamId, player_id, playerRole]
+    );
+    if (!result.rows.length) return res.status(409).json({ error: 'Player already on this team' });
+    res.status(201).json({ player: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /hall/leagues/:id/teams/:teamId/players/:playerId ──────────────────
+// Remove a player from a team. Sets left_date rather than hard deleting,
+// preserving the record for any matches already played.
+app.delete('/hall/leagues/:id/teams/:teamId/players/:playerId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, teamId, playerId } = req.params;
+  try {
+    const teamCheck = await pool.query(
+      `SELECT t.id FROM teams t
+       JOIN leagues l ON l.id = t.league_id
+       WHERE t.id = $1 AND t.league_id = $2 AND l.poolhall_id = $3`,
+      [teamId, id, req.hallId]
+    );
+    if (teamCheck.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
+
+    const result = await pool.query(
+      `UPDATE team_players SET left_date = CURRENT_DATE
+       WHERE team_id = $1 AND player_id = $2 AND left_date IS NULL
+       RETURNING id, player_id, left_date`,
+      [teamId, playerId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Player not on this team' });
+    res.json({ removed: true, player: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // TRY LEAGUE SESSION ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
