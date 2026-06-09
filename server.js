@@ -1977,15 +1977,24 @@ app.put('/public/tryleague-sessions/:id/matches/:matchId', async (req, res) => {
 // Accepts a pg client (for transaction support), sessionId, and poolhallId.
 async function upsertTryLeagueStats(client, sessionId, poolhallId) {
   // Fetch all scored matches for this session.
-  // For rotate matches: count p1 (Alpha/large-side player) but NOT p2 (the rotate double).
-  // is_rotate=true means p2 is the Beta player playing their second game — exclude their W/L/pts.
-  // p1 on a rotate match is always the Alpha large-side player with no normal match that round — always count them.
+  // Rotate matches: W/L counted for the non-double player only (identified at runtime).
+  // Points: rotate matches excluded entirely from personal stats — only non-rotate matches count.
   const matches = await client.query(
     `SELECT p1_id, p2_id, winner_id, is_rotate, score1, score2
      FROM tryleague_matches
      WHERE session_id = $1 AND status = 'done' AND winner_id IS NOT NULL AND score1 IS NOT NULL`,
     [sessionId]
   );
+
+  // Find the rotate double per round: the player appearing in both a rotate AND a normal match
+  // in this session. Their rotate appearance doesn't count for personal W/L or points.
+  const normalMatchPlayerIds = new Set();
+  for (const m of matches.rows) {
+    if (!m.is_rotate) {
+      normalMatchPlayerIds.add(m.p1_id);
+      normalMatchPlayerIds.add(m.p2_id);
+    }
+  }
 
   const statsMap = new Map(); // player_id → { wins, losses, points }
 
@@ -1994,20 +2003,20 @@ async function upsertTryLeagueStats(client, sessionId, poolhallId) {
   };
 
   for (const m of matches.rows) {
-    const winnerId = m.winner_id;
-    const loserId  = m.winner_id === m.p1_id ? m.p2_id : m.p1_id;
-    const winScore = m.winner_id === m.p1_id ? m.score1 : m.score2;
+    const winnerId  = m.winner_id;
+    const loserId   = m.winner_id === m.p1_id ? m.p2_id : m.p1_id;
+    const winScore  = m.winner_id === m.p1_id ? m.score1 : m.score2;
     const loseScore = m.winner_id === m.p1_id ? m.score2 : m.score1;
 
     if (m.is_rotate) {
-      // Only count the Alpha/large-side player (p1). p2 is the Beta rotate double — skip their stats.
-      const alphaId = m.p1_id;
-      const alphaWon = m.winner_id === m.p1_id;
-      const alphaScore = alphaWon ? winScore : loseScore;
-      ensure(alphaId);
-      if (alphaWon) statsMap.get(alphaId).wins   += 1;
-      else          statsMap.get(alphaId).losses  += 1;
-      statsMap.get(alphaId).points += alphaScore;
+      // The rotate double is whichever player also appears in normal matches.
+      // Count W/L for the non-double player only. Points excluded for both on rotate matches.
+      const doubleId   = normalMatchPlayerIds.has(m.p1_id) ? m.p1_id : m.p2_id;
+      const nonDoubleId = m.p1_id === doubleId ? m.p2_id : m.p1_id;
+      ensure(nonDoubleId);
+      if (m.winner_id === nonDoubleId) statsMap.get(nonDoubleId).wins   += 1;
+      else                             statsMap.get(nonDoubleId).losses  += 1;
+      // No points for rotate matches
     } else {
       ensure(winnerId);
       ensure(loserId);
