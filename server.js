@@ -2070,6 +2070,28 @@ app.put('/hall/tryleague-sessions/:id', requireAuth, requireHallAdmin, async (re
   }
 });
 
+// ── PUT /hall/tryleague-sessions/:id/pin ─────────────────────────────────────
+// Update captain PIN only — leaves all other config fields untouched.
+// No status restriction — valid for setup, running, or finished sessions.
+app.put('/hall/tryleague-sessions/:id/pin', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { pin } = req.body;
+  if (!pin || !/^\d{4}$/.test(pin)) return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+  try {
+    const result = await pool.query(
+      `UPDATE tryleague_sessions
+       SET config = jsonb_set(config, '{captain_pin}', $1::jsonb)
+       WHERE session_id = $2 AND poolhall_id = $3
+       RETURNING session_id, name, config`,
+      [JSON.stringify(pin), id, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+    res.json({ session: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── DELETE /hall/tryleague-sessions/:id ──────────────────────────────────────
 app.delete('/hall/tryleague-sessions/:id', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
