@@ -1443,8 +1443,111 @@ app.post('/hall/roundrobin-tournaments/:id/schedule', requireAuth, requireHallAd
               match_num: mn,
               p1_id:     a,
               p2_id:     isBye ? null : b,
-              is_bye:    isBye
+              is_bye:    isBye,
+              is_makeup: false
             });
+          }
+        }
+      }
+
+      // ── Make-up round for odd-player groups ───────────────────────────────────
+      // Every player who received a bye needs one real scoring round to make up for it.
+      // Bye players are paired against each other (randomly, no repeat opponents).
+      // If the bye pool is odd, the leftover "odd man out" is paired against the
+      // closest-rated non-bye player they haven't faced — that opponent does not score
+      // (is_makeup = true, p1 = bye player who scores, p2 = non-scoring body).
+      if (hasBye) {
+        const makeupRound = rounds + 1;
+
+        // Collect all players who received at least one bye
+        const byePlayers  = playerIds.filter(pid => (byeCount.get(pid) || 0) > 0);
+        const nonByePlayers = playerIds.filter(pid => (byeCount.get(pid) || 0) === 0);
+
+        // Build seed_rating lookup for this group (for odd-man-out closest rating search)
+        const ratingResult = await pool.query(
+          `SELECT rtp.player_id, rtp.seed_rating
+           FROM roundrobin_tournament_players rtp
+           WHERE rtp.tournament_id = $1 AND rtp.player_id = ANY($2::int[])`,
+          [id, playerIds]
+        );
+        const ratingMap = new Map(ratingResult.rows.map(r => [r.player_id, +r.seed_rating || 0]));
+
+        // Shuffle bye players and pair them — retry up to 20 times to avoid repeat opponents
+        let byePairs = [];
+        let oddManOut = null;
+
+        for (let attempt = 0; attempt < 20; attempt++) {
+          const shuffled = [...byePlayers].sort(() => Math.random() - 0.5);
+          const pairs    = [];
+          let conflict   = false;
+
+          for (let i = 0; i < shuffled.length - 1; i += 2) {
+            const a = shuffled[i];
+            const b = shuffled[i + 1];
+            if (faced.get(a)?.has(b)) { conflict = true; break; }
+            pairs.push([a, b]);
+          }
+
+          if (!conflict) {
+            byePairs   = pairs;
+            oddManOut  = shuffled.length % 2 === 1 ? shuffled[shuffled.length - 1] : null;
+            break;
+          }
+
+          // Last attempt — accept best available even with a conflict
+          if (attempt === 19) {
+            byePairs  = [];
+            const sh2 = [...byePlayers].sort(() => Math.random() - 0.5);
+            for (let i = 0; i < sh2.length - 1; i += 2) byePairs.push([sh2[i], sh2[i + 1]]);
+            oddManOut = sh2.length % 2 === 1 ? sh2[sh2.length - 1] : null;
+          }
+        }
+
+        // Emit make-up match rows for paired bye players (both score normally)
+        for (const [a, b] of byePairs) {
+          faced.get(a)?.add(b);
+          faced.get(b)?.add(a);
+          for (let mn = 1; mn <= matchesPerRound; mn++) {
+            matchRows.push({
+              group_idx: gi,
+              round_num: makeupRound,
+              match_num: mn,
+              p1_id:     a,
+              p2_id:     b,
+              is_bye:    false,
+              is_makeup: false
+            });
+          }
+        }
+
+        // Emit make-up match row for odd man out — find closest-rated non-bye opponent
+        // they haven't faced; fall back to closest rated if all have been faced already
+        if (oddManOut !== null) {
+          const oomRating = ratingMap.get(oddManOut) || 0;
+
+          // Sort non-bye players by rating proximity to odd man out
+          const candidates = [...nonByePlayers].sort((a, b) =>
+            Math.abs(ratingMap.get(a) - oomRating) - Math.abs(ratingMap.get(b) - oomRating)
+          );
+
+          // Prefer someone not yet faced; fall back to closest regardless
+          const body =
+            candidates.find(pid => !faced.get(oddManOut)?.has(pid)) ||
+            candidates[0] ||
+            null;
+
+          if (body !== null) {
+            for (let mn = 1; mn <= matchesPerRound; mn++) {
+              matchRows.push({
+                group_idx: gi,
+                round_num: makeupRound,
+                match_num: mn,
+                p1_id:     oddManOut,  // bye player — scores
+                p2_id:     body,       // non-bye body — does not score
+                is_bye:    false,
+                is_makeup: true
+              });
+            }
           }
         }
       }
@@ -1472,9 +1575,9 @@ app.post('/hall/roundrobin-tournaments/:id/schedule', requireAuth, requireHallAd
       for (const m of matchRows) {
         await client.query(
           `INSERT INTO roundrobin_matches
-             (tournament_id, group_idx, round_num, match_num, p1_id, p2_id, is_bye, status, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NOW(), NOW())`,
-          [id, m.group_idx, m.round_num, m.match_num, m.p1_id, m.p2_id || null, m.is_bye]
+             (tournament_id, group_idx, round_num, match_num, p1_id, p2_id, is_bye, is_makeup, status, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
+          [id, m.group_idx, m.round_num, m.match_num, m.p1_id, m.p2_id || null, m.is_bye, m.is_makeup || false]
         );
       }
 
@@ -1495,7 +1598,7 @@ app.post('/hall/roundrobin-tournaments/:id/schedule', requireAuth, requireHallAd
     // Return the matches with player names joined
     const matchResult = await pool.query(
       `SELECT m.match_id, m.group_idx, m.round_num, m.match_num,
-              m.p1_id, m.p2_id, m.is_bye, m.status,
+              m.p1_id, m.p2_id, m.is_bye, m.is_makeup, m.status,
               p1.first_name AS p1_first, p1.last_name AS p1_last,
               p1.hall_rating AS p1_rating,
               p2.first_name AS p2_first, p2.last_name AS p2_last,
@@ -1529,7 +1632,7 @@ app.get('/hall/roundrobin-tournaments/:id/matches', requireAuth, requireHallAuth
 
     const result = await pool.query(
       `SELECT m.match_id, m.group_idx, m.round_num, m.match_num,
-              m.p1_id, m.p2_id, m.is_bye, m.status, m.winner_id, m.score1, m.score2,
+              m.p1_id, m.p2_id, m.is_bye, m.is_makeup, m.status, m.winner_id, m.score1, m.score2,
               p1.first_name AS p1_first, p1.last_name AS p1_last,
               p1.hall_rating AS p1_rating,
               p2.first_name AS p2_first, p2.last_name AS p2_last,
