@@ -2055,7 +2055,8 @@ app.post('/hall/leagues/:id/teams/:teamId/players', requireAuth, requireHallAdmi
     const result = await pool.query(
       `INSERT INTO team_players (team_id, player_id, role, joined_date)
        VALUES ($1, $2, $3, CURRENT_DATE)
-       ON CONFLICT (team_id, player_id) DO NOTHING
+       ON CONFLICT (team_id, player_id) DO UPDATE
+         SET left_date = NULL, role = EXCLUDED.role, joined_date = CURRENT_DATE
        RETURNING id, team_id, player_id, role, joined_date`,
       [teamId, player_id, playerRole]
     );
