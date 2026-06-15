@@ -1781,7 +1781,7 @@ app.put('/hall/leagues/:id', requireAuth, requireHallAdmin, async (req, res) => 
     custom_dates, skip_dates, players_per_team, matches_per_night,
     preferred_rating_type, rating_enforcement, win_condition,
     tiebreaker_order, bye_handling, has_playoffs, playoff_format,
-    leaderboard_default, player_lb_default
+    leaderboard_default, player_lb_default, config
   } = req.body;
 
   const validStatuses = ['draft', 'active', 'completed', 'archived'];
@@ -1817,8 +1817,9 @@ app.put('/hall/leagues/:id', requireAuth, requireHallAdmin, async (req, res) => 
          playoff_format        = COALESCE($18, playoff_format),
          leaderboard_default   = COALESCE($19, leaderboard_default),
          player_lb_default     = COALESCE($20, player_lb_default),
+         config                = COALESCE($21, config),
          updated_at            = NOW()
-       WHERE id = $21 AND poolhall_id = $22
+       WHERE id = $22 AND poolhall_id = $23
        RETURNING *`,
       [
         name || null, season_label || null, status || null, playing_day || null,
@@ -1833,6 +1834,7 @@ app.put('/hall/leagues/:id', requireAuth, requireHallAdmin, async (req, res) => 
         has_playoffs != null ? has_playoffs : null,
         playoff_format || null,
         leaderboard_default || null, player_lb_default || null,
+        config ? JSON.stringify(config) : null,
         id, req.hallId
       ]
     );
