@@ -1781,12 +1781,16 @@ app.put('/hall/leagues/:id', requireAuth, requireHallAdmin, async (req, res) => 
     custom_dates, skip_dates, players_per_team, matches_per_night,
     preferred_rating_type, rating_enforcement, win_condition,
     tiebreaker_order, bye_handling, has_playoffs, playoff_format,
-    leaderboard_default, player_lb_default, config
+    leaderboard_default, player_lb_default, config, schedule_type
   } = req.body;
 
   const validStatuses = ['draft', 'active', 'completed', 'archived'];
   if (status && !validStatuses.includes(status)) {
     return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+  }
+  const validScheduleTypes = ['random', 'defined'];
+  if (schedule_type && !validScheduleTypes.includes(schedule_type)) {
+    return res.status(400).json({ error: `schedule_type must be one of: ${validScheduleTypes.join(', ')}` });
   }
 
   try {
@@ -1818,8 +1822,9 @@ app.put('/hall/leagues/:id', requireAuth, requireHallAdmin, async (req, res) => 
          leaderboard_default   = COALESCE($19, leaderboard_default),
          player_lb_default     = COALESCE($20, player_lb_default),
          config                = COALESCE($21, config),
+         schedule_type         = COALESCE($22, schedule_type),
          updated_at            = NOW()
-       WHERE id = $22 AND poolhall_id = $23
+       WHERE id = $23 AND poolhall_id = $24
        RETURNING *`,
       [
         name || null, season_label || null, status || null, playing_day || null,
@@ -1835,6 +1840,7 @@ app.put('/hall/leagues/:id', requireAuth, requireHallAdmin, async (req, res) => 
         playoff_format || null,
         leaderboard_default || null, player_lb_default || null,
         config ? JSON.stringify(config) : null,
+        schedule_type || null,
         id, req.hallId
       ]
     );
@@ -2758,6 +2764,194 @@ app.get('/public/poolhalls/:publicId/tl-player-stats', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ── POST /hall/leagues/:id/activate ──────────────────────────────────────────
+// Activates a draft league: sets status → active, generates league_nights rows
+// (one per playing date derived from start_date, end_date, playing_day, skip_dates).
+// For 'random' schedule_type: also generates balanced league_matchups for every night.
+// For 'defined' schedule_type: nights are created empty; convenor fills matchups in
+//   league-management.html.
+// Readiness gate: ≥2 teams, all teams have ≥1 player. (UI enforces ≥4 teams / full
+//   rosters; API enforces a looser minimum so manual DB fixes don't block activation.)
+app.post('/hall/leagues/:id/activate', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // ── Load league ──────────────────────────────────────────────────────────
+    const leagueRes = await client.query(
+      `SELECT * FROM leagues WHERE id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (leagueRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'League not found' });
+    }
+    const league = leagueRes.rows[0];
+    if (league.status !== 'draft') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Only draft leagues can be activated' });
+    }
+    if (!league.start_date || !league.end_date || !league.playing_day) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'League must have start date, end date, and playing night set' });
+    }
+
+    // ── Load teams + rosters ─────────────────────────────────────────────────
+    const teamsRes = await client.query(
+      `SELECT t.id, t.name,
+              COUNT(tp.player_id) FILTER (WHERE tp.left_date IS NULL) AS player_count
+         FROM teams t
+         LEFT JOIN team_players tp ON tp.team_id = t.id
+        WHERE t.league_id = $1
+        GROUP BY t.id, t.name
+        ORDER BY t.id`,
+      [id]
+    );
+    const teams = teamsRes.rows;
+    if (teams.length < 2) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'League needs at least 2 teams to activate' });
+    }
+    const emptyTeams = teams.filter(t => parseInt(t.player_count) === 0);
+    if (emptyTeams.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: `${emptyTeams.length} team(s) have no players: ${emptyTeams.map(t => t.name).join(', ')}`
+      });
+    }
+
+    // ── Generate playing dates ────────────────────────────────────────────────
+    // Walk from start_date to end_date, collect dates matching playing_day,
+    // then remove any that fall in skip_dates.
+    const DAY_MAP = { Sunday:0, Monday:1, Tuesday:2, Wednesday:3, Thursday:4, Friday:5, Saturday:6 };
+    const targetDay  = DAY_MAP[league.playing_day];
+    const skipSet    = new Set(
+      (league.skip_dates || []).map(s => (s.date || s).slice(0, 10))
+    );
+
+    const start  = new Date(league.start_date);
+    const end    = new Date(league.end_date);
+    const dates  = [];
+
+    // Advance to first matching weekday on or after start_date
+    const cur = new Date(start);
+    const diff = (targetDay - cur.getDay() + 7) % 7;
+    cur.setDate(cur.getDate() + diff);
+
+    while (cur <= end) {
+      const iso = cur.toISOString().slice(0, 10);
+      if (!skipSet.has(iso)) dates.push(iso);
+      cur.setDate(cur.getDate() + 7);
+    }
+
+    if (dates.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'No valid playing dates found between start and end date' });
+    }
+
+    // ── Insert league_nights ──────────────────────────────────────────────────
+    // Delete any existing nights first (safe — league is still draft)
+    await client.query(`DELETE FROM league_nights WHERE league_id = $1`, [id]);
+
+    const nightRows = [];
+    for (let i = 0; i < dates.length; i++) {
+      const r = await client.query(
+        `INSERT INTO league_nights (league_id, poolhall_id, night_number, night_date, status)
+         VALUES ($1, $2, $3, $4, 'scheduled')
+         RETURNING id`,
+        [id, req.hallId, i + 1, dates[i]]
+      );
+      nightRows.push({ nightId: r.rows[0].id, date: dates[i], nightNumber: i + 1 });
+    }
+
+    // ── For 'random' leagues: generate balanced matchup rotation ─────────────
+    let matchupsGenerated = 0;
+    if (league.schedule_type === 'random' || !league.schedule_type) {
+      const teamIds   = teams.map(t => t.id);
+      const numTeams  = teamIds.length;
+      const hasBye    = numTeams % 2 === 1;
+      // Use circle/round-robin algorithm to generate balanced pairings.
+      // If odd number of teams, add a null "bye" slot.
+      const slots = hasBye ? [...teamIds, null] : [...teamIds];
+      const n     = slots.length; // always even
+      const rounds = [];
+
+      // Standard circle rotation: fix first slot, rotate the rest
+      for (let r = 0; r < n - 1; r++) {
+        const round = [];
+        for (let i = 0; i < n / 2; i++) {
+          const home = slots[i];
+          const away = slots[n - 1 - i];
+          round.push({ home, away });
+        }
+        rounds.push(round);
+        // Rotate: keep slots[0] fixed, rotate slots[1..n-1]
+        const last = slots[n - 1];
+        for (let i = n - 1; i > 1; i--) slots[i] = slots[i - 1];
+        slots[1] = last;
+      }
+
+      // Assign rounds to nights, cycling if more nights than rounds
+      for (let nightIdx = 0; nightIdx < nightRows.length; nightIdx++) {
+        const round   = rounds[nightIdx % rounds.length];
+        const nightId = nightRows[nightIdx].nightId;
+        for (const pair of round) {
+          if (pair.home === null || pair.away === null) {
+            // Bye week — the non-null team gets a bye
+            const byeTeam = pair.home !== null ? pair.home : pair.away;
+            await client.query(
+              `INSERT INTO league_matchups
+                 (league_night_id, league_id, poolhall_id, home_team_id, away_team_id, is_bye)
+               VALUES ($1, $2, $3, $4, NULL, TRUE)`,
+              [nightId, id, req.hallId, byeTeam]
+            );
+          } else {
+            // Normal matchup — normalise: lower id = home
+            const homeId = Math.min(pair.home, pair.away);
+            const awayId = Math.max(pair.home, pair.away);
+            await client.query(
+              `INSERT INTO league_matchups
+                 (league_night_id, league_id, poolhall_id, home_team_id, away_team_id, is_bye)
+               VALUES ($1, $2, $3, $4, $5, FALSE)`,
+              [nightId, id, req.hallId, homeId, awayId]
+            );
+          }
+          matchupsGenerated++;
+        }
+      }
+    }
+
+    // ── Set league status → active ────────────────────────────────────────────
+    const updatedLeague = await client.query(
+      `UPDATE leagues SET status = 'active', updated_at = NOW()
+       WHERE id = $1 RETURNING *`,
+      [id]
+    );
+
+    await client.query('COMMIT');
+
+    console.log(`[LEAGUE ACTIVATE] id=${id} name="${league.name}" poolhall_id=${req.hallId} ` +
+      `nights=${nightRows.length} matchups=${matchupsGenerated} schedule_type=${league.schedule_type || 'random'} ` +
+      `activated_by=user_id:${req.user.user_id}`);
+
+    res.json({
+      league:            updatedLeague.rows[0],
+      nights_generated:  nightRows.length,
+      matchups_generated: matchupsGenerated,
+      playing_dates:     dates
+    });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[LEAGUE ACTIVATE ERROR]', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
