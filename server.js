@@ -2834,19 +2834,37 @@ app.post('/hall/leagues/:id/activate', requireAuth, requireHallAdmin, async (req
       (league.skip_dates || []).map(s => (s.date || s).slice(0, 10))
     );
 
-    const start  = new Date(league.start_date);
-    const end    = new Date(league.end_date);
+    // Parse Postgres `date` columns by their Y-M-D components rather than handing
+    // the raw value to `new Date(...)`. node-postgres returns `date` columns as
+    // JS Date objects already adjusted to midnight UTC for the given calendar date;
+    // re-deriving Y/M/D via the UTC getters (not local getters) avoids any
+    // dependency on the server process's configured timezone — this previously
+    // happened to work only because Render's default TZ is UTC, which is fragile.
+    function dateParts(d) {
+      const dt = (d instanceof Date) ? d : new Date(d);
+      return { y: dt.getUTCFullYear(), m: dt.getUTCMonth(), day: dt.getUTCDate() };
+    }
+    function isoFromParts(p) {
+      return `${p.y}-${String(p.m+1).padStart(2,'0')}-${String(p.day).padStart(2,'0')}`;
+    }
+
+    const startParts = dateParts(league.start_date);
+    const endParts    = dateParts(league.end_date);
+    const start = new Date(Date.UTC(startParts.y, startParts.m, startParts.day));
+    const end   = new Date(Date.UTC(endParts.y, endParts.m, endParts.day));
     const dates  = [];
 
-    // Advance to first matching weekday on or after start_date
+    // Advance to first matching weekday on or after start_date (all UTC-based,
+    // matching how start/end were just constructed — internally consistent
+    // regardless of host timezone).
     const cur = new Date(start);
-    const diff = (targetDay - cur.getDay() + 7) % 7;
-    cur.setDate(cur.getDate() + diff);
+    const diff = (targetDay - cur.getUTCDay() + 7) % 7;
+    cur.setUTCDate(cur.getUTCDate() + diff);
 
     while (cur <= end) {
-      const iso = cur.toISOString().slice(0, 10);
+      const iso = isoFromParts({ y: cur.getUTCFullYear(), m: cur.getUTCMonth(), day: cur.getUTCDate() });
       if (!skipSet.has(iso)) dates.push(iso);
-      cur.setDate(cur.getDate() + 7);
+      cur.setUTCDate(cur.getUTCDate() + 7);
     }
 
     if (dates.length === 0) {
