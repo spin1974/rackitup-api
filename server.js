@@ -2955,6 +2955,123 @@ app.post('/hall/leagues/:id/activate', requireAuth, requireHallAdmin, async (req
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════
+// LEAGUE MATCHUP DRAFTS — pre-activation schedule staging for 'defined' leagues
+// Built in league-setup.html Schedule tab, before league_nights exist.
+// Rows here are copied into league_matchups at activation (not yet wired).
+// ══════════════════════════════════════════════════════════════════════════
+
+// GET /hall/leagues/:id/matchup-drafts — all draft matchups for a league, all weeks
+app.get('/hall/leagues/:id/matchup-drafts', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    // Confirm league belongs to this hall
+    const leagueCheck = await pool.query(
+      `SELECT id FROM leagues WHERE id = $1 AND poolhall_id = $2`, [id, req.hallId]
+    );
+    if (leagueCheck.rows.length === 0) return res.status(404).json({ error: 'League not found' });
+
+    const result = await pool.query(
+      `SELECT d.*, ht.name AS home_team_name, at.name AS away_team_name
+         FROM league_matchup_drafts d
+         JOIN teams ht ON ht.id = d.home_team_id
+         LEFT JOIN teams at ON at.id = d.away_team_id
+        WHERE d.league_id = $1
+        ORDER BY d.week_number, d.id`,
+      [id]
+    );
+    res.json({ drafts: result.rows });
+  } catch (err) {
+    console.error('[MATCHUP DRAFTS GET ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /hall/leagues/:id/matchup-drafts — create a draft matchup row
+// Body: { week_number, home_team_id, away_team_id (null if bye), is_bye }
+app.post('/hall/leagues/:id/matchup-drafts', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { week_number, home_team_id, away_team_id, is_bye } = req.body;
+
+  if (!week_number || !home_team_id) {
+    return res.status(400).json({ error: 'week_number and home_team_id are required' });
+  }
+  if (!is_bye && !away_team_id) {
+    return res.status(400).json({ error: 'away_team_id is required unless is_bye is true' });
+  }
+  if (is_bye && away_team_id) {
+    return res.status(400).json({ error: 'away_team_id must be empty when is_bye is true' });
+  }
+  if (away_team_id && parseInt(home_team_id) === parseInt(away_team_id)) {
+    return res.status(400).json({ error: 'A team cannot play itself' });
+  }
+
+  try {
+    const leagueCheck = await pool.query(
+      `SELECT id FROM leagues WHERE id = $1 AND poolhall_id = $2`, [id, req.hallId]
+    );
+    if (leagueCheck.rows.length === 0) return res.status(404).json({ error: 'League not found' });
+
+    const result = await pool.query(
+      `INSERT INTO league_matchup_drafts
+         (league_id, poolhall_id, week_number, home_team_id, away_team_id, is_bye)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [id, req.hallId, week_number, home_team_id, away_team_id || null, !!is_bye]
+    );
+    res.json({ draft: result.rows[0] });
+  } catch (err) {
+    console.error('[MATCHUP DRAFTS POST ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /hall/leagues/:id/matchup-drafts/:draftId — update a draft matchup row
+app.put('/hall/leagues/:id/matchup-drafts/:draftId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, draftId } = req.params;
+  const { home_team_id, away_team_id, is_bye } = req.body;
+
+  if (away_team_id && home_team_id && parseInt(home_team_id) === parseInt(away_team_id)) {
+    return res.status(400).json({ error: 'A team cannot play itself' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE league_matchup_drafts SET
+         home_team_id = COALESCE($1, home_team_id),
+         away_team_id = $2,
+         is_bye       = COALESCE($3, is_bye),
+         updated_at   = NOW()
+       WHERE id = $4 AND league_id = $5 AND poolhall_id = $6
+       RETURNING *`,
+      [home_team_id || null, away_team_id || null, is_bye != null ? is_bye : null, draftId, id, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Draft matchup not found' });
+    res.json({ draft: result.rows[0] });
+  } catch (err) {
+    console.error('[MATCHUP DRAFTS PUT ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /hall/leagues/:id/matchup-drafts/:draftId
+app.delete('/hall/leagues/:id/matchup-drafts/:draftId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, draftId } = req.params;
+  try {
+    const result = await pool.query(
+      `DELETE FROM league_matchup_drafts
+       WHERE id = $1 AND league_id = $2 AND poolhall_id = $3
+       RETURNING id`,
+      [draftId, id, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Draft matchup not found' });
+    res.json({ deleted: true });
+  } catch (err) {
+    console.error('[MATCHUP DRAFTS DELETE ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Rack It Up API running on port ${PORT}`);
