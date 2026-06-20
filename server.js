@@ -2159,6 +2159,16 @@ app.delete('/hall/leagues/:id/teams/:teamId/players/:playerId', requireAuth, req
 // (no captain change intended) pass assignCaptain=false — position 0 only stays
 // captain if it already was; it is never silently promoted as a side effect of
 // reordering players elsewhere in the list.
+//
+// Two-pass write (stage through negative sort_order, then write final values):
+// the unique index on (team_id, sort_order) is checked immediately on each row's
+// UPDATE, not deferred to commit — writing final positions directly in a single
+// pass can momentarily try to place a row at a sort_order another row in the
+// same team still occupies (e.g. moving C to position 0 while A still holds
+// position 0 until its own row is updated later in the loop), which the unique
+// index correctly rejects mid-transaction. Staging every row to a temporary,
+// guaranteed-unique negative value first avoids any such collision before the
+// second pass writes the real final positions.
 // Must be called with a `client` already inside a transaction (BEGIN done by caller).
 async function applyRosterOrder(client, teamId, playerIds, playersPerTeam, assignCaptain = false) {
   const current = await client.query(
@@ -2167,6 +2177,17 @@ async function applyRosterOrder(client, teamId, playerIds, playersPerTeam, assig
   );
   const currentRoleMap = new Map(current.rows.map(r => [r.player_id, r.role]));
 
+  // Pass 1: move every row to a temporary negative sort_order, unique per row,
+  // guaranteed not to collide with anyone's current or future real position.
+  for (let index = 0; index < playerIds.length; index++) {
+    await client.query(
+      `UPDATE team_players SET sort_order = $1 WHERE team_id = $2 AND player_id = $3`,
+      [-(index + 1), teamId, playerIds[index]]
+    );
+  }
+
+  // Pass 2: write final sort_order + recomputed role — no collisions possible
+  // now since every row currently holds a unique negative placeholder.
   for (let index = 0; index < playerIds.length; index++) {
     const pid = playerIds[index];
     const wasCaptain = currentRoleMap.get(pid) === 'captain';
