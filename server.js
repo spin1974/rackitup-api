@@ -3054,12 +3054,214 @@ app.get('/public/poolhalls/:publicId/tl-player-stats', async (req, res) => {
 });
 
 
+// ── Shared helper — derivePlayingDates ─────────────────────────────────────────
+// Walks from league.start_date to league.end_date, collecting dates matching
+// playing_day, minus any in skip_dates. Used by both POST /generate-schedule
+// (random leagues, pre-activation) and POST /activate (league_nights creation,
+// both schedule types) — extracted so the two stay in sync; this date-walk
+// previously lived only inline in /activate and had a documented timezone bug
+// history (see context_league.md), so it must not be duplicated/drifted again.
+// Parses Postgres `date` columns via UTC getters rather than handing the raw
+// value to `new Date(...)` directly — see the original fix's comments for why.
+function derivePlayingDates(league) {
+  const DAY_MAP = { Sunday:0, Monday:1, Tuesday:2, Wednesday:3, Thursday:4, Friday:5, Saturday:6 };
+  const targetDay = DAY_MAP[league.playing_day];
+  const skipSet = new Set((league.skip_dates || []).map(s => (s.date || s).slice(0, 10)));
+
+  function dateParts(d) {
+    const dt = (d instanceof Date) ? d : new Date(d);
+    return { y: dt.getUTCFullYear(), m: dt.getUTCMonth(), day: dt.getUTCDate() };
+  }
+  function isoFromParts(p) {
+    return `${p.y}-${String(p.m+1).padStart(2,'0')}-${String(p.day).padStart(2,'0')}`;
+  }
+
+  const startParts = dateParts(league.start_date);
+  const endParts    = dateParts(league.end_date);
+  const start = new Date(Date.UTC(startParts.y, startParts.m, startParts.day));
+  const end   = new Date(Date.UTC(endParts.y, endParts.m, endParts.day));
+  const dates = [];
+
+  const cur = new Date(start);
+  const diff = (targetDay - cur.getUTCDay() + 7) % 7;
+  cur.setUTCDate(cur.getUTCDate() + diff);
+
+  while (cur <= end) {
+    const iso = isoFromParts({ y: cur.getUTCFullYear(), m: cur.getUTCMonth(), day: cur.getUTCDate() });
+    if (!skipSet.has(iso)) dates.push(iso);
+    cur.setUTCDate(cur.getUTCDate() + 7);
+  }
+  return dates;
+}
+
+// ── Shared helper — circleMethodRoundRobin ─────────────────────────────────────
+// Standard circle method: fixes slots[0], rotates the rest. slots.length must
+// be even (caller pads with a null bye slot for odd team counts). Returns
+// slots.length - 1 rounds, each an array of { home, away } pairs (home/away
+// here are just "first/second" from this round's pairing — no semantic meaning
+// until the caller decides whether to flip for a recycled cycle).
+function circleMethodRoundRobin(slots) {
+  const n = slots.length;
+  const rounds = [];
+  const arr = slots.slice();
+  for (let r = 0; r < n - 1; r++) {
+    const round = [];
+    for (let i = 0; i < n / 2; i++) {
+      round.push({ home: arr[i], away: arr[n - 1 - i] });
+    }
+    rounds.push(round);
+    // Rotate: keep arr[0] fixed, rotate arr[1..n-1]
+    const last = arr[n - 1];
+    for (let i = n - 1; i > 1; i--) arr[i] = arr[i - 1];
+    arr[1] = last;
+  }
+  return rounds;
+}
+
+function shuffleArray(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// ── Shared helper — generateRandomSchedule ─────────────────────────────────────
+// Produces a balanced, fair schedule for `totalWeeks` weeks given `teamIds`.
+//
+// Even team count: shuffles team order ONCE at the start, runs the circle
+// method to get a full single round-robin, then RECYCLES that same rotation
+// for any additional weeks beyond one cycle — flipping home/away on every
+// other cycle (a cosmetic convention, no functional meaning since table
+// assignment is deferred to print-time). This guarantees fairness by
+// construction: every pair lands at floor(W/(T-1)) or that +1 meetings,
+// matching the same math the Schedule tab's balance checker already verifies.
+//
+// Odd team count (bye involved): reshuffles the team/bye arrangement at the
+// START OF EACH CYCLE, not just once — repeating the identical bye sequence
+// across cycles would always shortchange the same teams in any partial
+// "remainder" cycle (the last few weeks beyond a whole number of cycles).
+// Reshuffling per cycle doesn't guarantee perfectly even bye counts when the
+// week count doesn't divide cleanly (an irreducible limitation — see
+// context_league.md), but it avoids always favoring/disfavoring the same
+// fixed teams on every regeneration.
+//
+// Returns an array of `totalWeeks` weeks, each an array of { home, away }
+// pairs (away === null means home has the bye that week).
+function generateRandomSchedule(teamIds, totalWeeks) {
+  const isOdd = teamIds.length % 2 === 1;
+  const baseSlots = isOdd ? shuffleArray([...teamIds, null]) : shuffleArray([...teamIds]);
+
+  const weeks = [];
+  let cycleIndex = 0;
+  let cycleSlots = baseSlots;
+  while (weeks.length < totalWeeks) {
+    if (isOdd && cycleIndex > 0) cycleSlots = shuffleArray(baseSlots);
+    const rounds = circleMethodRoundRobin(cycleSlots);
+    const flip = cycleIndex % 2 === 1;
+    for (const round of rounds) {
+      if (weeks.length >= totalWeeks) break;
+      weeks.push(round.map(p => flip ? { home: p.away, away: p.home } : p));
+    }
+    cycleIndex++;
+  }
+  return weeks;
+}
+
+// ── POST /hall/leagues/:id/generate-schedule ───────────────────────────────────
+// Generates (or regenerates) a random schedule into league_matchup_drafts —
+// the same staging table defined leagues use, so the result is reviewable and
+// editable in the Schedule tab's matchup builder before activation, exactly
+// like a manually defined schedule. Wipes any existing drafts for this league
+// first (safe pre-activation — drafts are just staging data). Works for ANY
+// league regardless of schedule_type; the Schedule tab only surfaces the
+// Generate/Regenerate button for 'random' leagues, but nothing here enforces
+// that — a 'defined' league's admin could in principle use this as a starting
+// point too, then hand-edit from there.
+app.post('/hall/leagues/:id/generate-schedule', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const leagueRes = await client.query(
+      `SELECT * FROM leagues WHERE id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (leagueRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'League not found' });
+    }
+    const league = leagueRes.rows[0];
+    if (!league.start_date || !league.end_date || !league.playing_day) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'League must have start date, end date, and playing night set before a schedule can be generated' });
+    }
+
+    const teamsRes = await client.query(
+      `SELECT id FROM teams WHERE league_id = $1 ORDER BY id`,
+      [id]
+    );
+    const teamIds = teamsRes.rows.map(r => r.id);
+    if (teamIds.length < 2) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'League needs at least 2 teams to generate a schedule' });
+    }
+
+    const dates = derivePlayingDates(league);
+    if (dates.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'No valid playing dates found between start and end date' });
+    }
+
+    const weeks = generateRandomSchedule(teamIds, dates.length);
+
+    // Wipe any existing drafts for this league before writing the new set —
+    // this IS the regenerate path; there's no partial-update case here.
+    await client.query(`DELETE FROM league_matchup_drafts WHERE league_id = $1`, [id]);
+
+    let draftsCreated = 0;
+    for (let weekIdx = 0; weekIdx < weeks.length; weekIdx++) {
+      const weekNumber = weekIdx + 1;
+      for (const pair of weeks[weekIdx]) {
+        const isBye = pair.home === null || pair.away === null;
+        const homeId = isBye ? (pair.home !== null ? pair.home : pair.away) : pair.home;
+        const awayId = isBye ? null : pair.away;
+        await client.query(
+          `INSERT INTO league_matchup_drafts
+             (league_id, poolhall_id, week_number, home_team_id, away_team_id, is_bye)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [id, req.hallId, weekNumber, homeId, awayId, isBye]
+        );
+        draftsCreated++;
+      }
+    }
+
+    await client.query('COMMIT');
+    console.log(`[GENERATE SCHEDULE] league_id=${id} poolhall_id=${req.hallId} teams=${teamIds.length} weeks=${weeks.length} drafts=${draftsCreated} by user_id:${req.user.user_id}`);
+    res.json({ weeks_generated: weeks.length, drafts_created: draftsCreated });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[GENERATE SCHEDULE ERROR]', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ── POST /hall/leagues/:id/activate ──────────────────────────────────────────
 // Activates a draft league: sets status → active, generates league_nights rows
-// (one per playing date derived from start_date, end_date, playing_day, skip_dates).
-// For 'random' schedule_type: also generates balanced league_matchups for every night.
-// For 'defined' schedule_type: nights are created empty; convenor fills matchups in
-//   league-management.html.
+// (one per playing date derived from start_date, end_date, playing_day, skip_dates),
+// then copies league_matchup_drafts → real league_matchups, matching each
+// draft's week_number to the corresponding night_number from the date-walk.
+// Unified for BOTH schedule types as of 2026-06-20 — 'random' leagues now
+// generate their drafts pre-activation via POST /generate-schedule (reviewable
+// in the Schedule tab, same as a manually defined schedule); activation itself
+// no longer generates anything, it only copies whatever's staged. Requires at
+// least one draft to exist — an empty draft set blocks activation with a clear
+// error pointing back to the Schedule tab, rather than silently activating
+// with zero matchups.
 // Readiness gate: ≥2 teams, all teams have ≥1 player. (UI enforces ≥4 teams / full
 //   rosters; API enforces a looser minimum so manual DB fixes don't block activation.)
 app.post('/hall/leagues/:id/activate', requireAuth, requireHallAdmin, async (req, res) => {
@@ -3112,47 +3314,7 @@ app.post('/hall/leagues/:id/activate', requireAuth, requireHallAdmin, async (req
     }
 
     // ── Generate playing dates ────────────────────────────────────────────────
-    // Walk from start_date to end_date, collect dates matching playing_day,
-    // then remove any that fall in skip_dates.
-    const DAY_MAP = { Sunday:0, Monday:1, Tuesday:2, Wednesday:3, Thursday:4, Friday:5, Saturday:6 };
-    const targetDay  = DAY_MAP[league.playing_day];
-    const skipSet    = new Set(
-      (league.skip_dates || []).map(s => (s.date || s).slice(0, 10))
-    );
-
-    // Parse Postgres `date` columns by their Y-M-D components rather than handing
-    // the raw value to `new Date(...)`. node-postgres returns `date` columns as
-    // JS Date objects already adjusted to midnight UTC for the given calendar date;
-    // re-deriving Y/M/D via the UTC getters (not local getters) avoids any
-    // dependency on the server process's configured timezone — this previously
-    // happened to work only because Render's default TZ is UTC, which is fragile.
-    function dateParts(d) {
-      const dt = (d instanceof Date) ? d : new Date(d);
-      return { y: dt.getUTCFullYear(), m: dt.getUTCMonth(), day: dt.getUTCDate() };
-    }
-    function isoFromParts(p) {
-      return `${p.y}-${String(p.m+1).padStart(2,'0')}-${String(p.day).padStart(2,'0')}`;
-    }
-
-    const startParts = dateParts(league.start_date);
-    const endParts    = dateParts(league.end_date);
-    const start = new Date(Date.UTC(startParts.y, startParts.m, startParts.day));
-    const end   = new Date(Date.UTC(endParts.y, endParts.m, endParts.day));
-    const dates  = [];
-
-    // Advance to first matching weekday on or after start_date (all UTC-based,
-    // matching how start/end were just constructed — internally consistent
-    // regardless of host timezone).
-    const cur = new Date(start);
-    const diff = (targetDay - cur.getUTCDay() + 7) % 7;
-    cur.setUTCDate(cur.getUTCDate() + diff);
-
-    while (cur <= end) {
-      const iso = isoFromParts({ y: cur.getUTCFullYear(), m: cur.getUTCMonth(), day: cur.getUTCDate() });
-      if (!skipSet.has(iso)) dates.push(iso);
-      cur.setUTCDate(cur.getUTCDate() + 7);
-    }
-
+    const dates = derivePlayingDates(league);
     if (dates.length === 0) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'No valid playing dates found between start and end date' });
@@ -3173,61 +3335,52 @@ app.post('/hall/leagues/:id/activate', requireAuth, requireHallAdmin, async (req
       nightRows.push({ nightId: r.rows[0].id, date: dates[i], nightNumber: i + 1 });
     }
 
-    // ── For 'random' leagues: generate balanced matchup rotation ─────────────
+    // ── Copy league_matchup_drafts → real league_matchups ────────────────────
+    // Unified path for BOTH schedule types: a 'random' league's drafts come
+    // from POST /generate-schedule (run pre-activation, reviewable in the
+    // Schedule tab); a 'defined' league's drafts come from the manual matchup
+    // builder. Either way, activation just copies whatever's staged, matching
+    // week_number → the night_number from the date-walk above. Requires drafts
+    // to already exist — activation no longer generates a schedule itself, so
+    // an empty draft set is a real error, not a silent zero-matchup result.
+    const draftsRes = await client.query(
+      `SELECT week_number, home_team_id, away_team_id, is_bye
+       FROM league_matchup_drafts WHERE league_id = $1 ORDER BY week_number, id`,
+      [id]
+    );
+    if (draftsRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'No schedule has been built yet. Generate or build a schedule in the Schedule tab before activating.'
+      });
+    }
+
+    // Guard against stale drafts: if the league's start/end date or skip_dates
+    // changed after the schedule was generated/built, the derived night count
+    // here may no longer match what the drafts were built against. Rather than
+    // silently dropping matchups for weeks beyond the current night count (or
+    // leaving nights with no matchups at all), block activation with a clear
+    // error pointing back to the Schedule tab so the admin can regenerate or
+    // re-check the schedule against the league's current dates.
+    const maxDraftWeek = Math.max(...draftsRes.rows.map(d => d.week_number));
+    if (maxDraftWeek > nightRows.length) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: `Schedule has matchups through week ${maxDraftWeek}, but the league's current dates only produce ${nightRows.length} week${nightRows.length!==1?'s':''}. Regenerate or review the schedule in the Schedule tab — likely the date range or skip dates changed after the schedule was built.`
+      });
+    }
+
     let matchupsGenerated = 0;
-    if (league.schedule_type === 'random' || !league.schedule_type) {
-      const teamIds   = teams.map(t => t.id);
-      const numTeams  = teamIds.length;
-      const hasBye    = numTeams % 2 === 1;
-      // Use circle/round-robin algorithm to generate balanced pairings.
-      // If odd number of teams, add a null "bye" slot.
-      const slots = hasBye ? [...teamIds, null] : [...teamIds];
-      const n     = slots.length; // always even
-      const rounds = [];
-
-      // Standard circle rotation: fix first slot, rotate the rest
-      for (let r = 0; r < n - 1; r++) {
-        const round = [];
-        for (let i = 0; i < n / 2; i++) {
-          const home = slots[i];
-          const away = slots[n - 1 - i];
-          round.push({ home, away });
-        }
-        rounds.push(round);
-        // Rotate: keep slots[0] fixed, rotate slots[1..n-1]
-        const last = slots[n - 1];
-        for (let i = n - 1; i > 1; i--) slots[i] = slots[i - 1];
-        slots[1] = last;
-      }
-
-      // Assign rounds to nights, cycling if more nights than rounds
-      for (let nightIdx = 0; nightIdx < nightRows.length; nightIdx++) {
-        const round   = rounds[nightIdx % rounds.length];
-        const nightId = nightRows[nightIdx].nightId;
-        for (const pair of round) {
-          if (pair.home === null || pair.away === null) {
-            // Bye week — the non-null team gets a bye
-            const byeTeam = pair.home !== null ? pair.home : pair.away;
-            await client.query(
-              `INSERT INTO league_matchups
-                 (league_night_id, league_id, poolhall_id, home_team_id, away_team_id, is_bye)
-               VALUES ($1, $2, $3, $4, NULL, TRUE)`,
-              [nightId, id, req.hallId, byeTeam]
-            );
-          } else {
-            // Normal matchup — normalise: lower id = home
-            const homeId = Math.min(pair.home, pair.away);
-            const awayId = Math.max(pair.home, pair.away);
-            await client.query(
-              `INSERT INTO league_matchups
-                 (league_night_id, league_id, poolhall_id, home_team_id, away_team_id, is_bye)
-               VALUES ($1, $2, $3, $4, $5, FALSE)`,
-              [nightId, id, req.hallId, homeId, awayId]
-            );
-          }
-          matchupsGenerated++;
-        }
-      }
+    for (const draft of draftsRes.rows) {
+      const night = nightRows.find(n => n.nightNumber === draft.week_number);
+      if (!night) continue; // shouldn't happen given the guard above, but skip defensively rather than crash
+      await client.query(
+        `INSERT INTO league_matchups
+           (league_night_id, league_id, poolhall_id, home_team_id, away_team_id, is_bye)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [night.nightId, id, req.hallId, draft.home_team_id, draft.away_team_id, draft.is_bye]
+      );
+      matchupsGenerated++;
     }
 
     // ── Set league status → active ────────────────────────────────────────────
