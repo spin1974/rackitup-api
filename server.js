@@ -2068,22 +2068,30 @@ app.post('/hall/leagues/:id/teams/:teamId/players', requireAuth, requireHallAdmi
       const nextPos = +posResult.rows[0].next_pos;
       const derivedRole = nextPos < playersPerTeam ? 'regular' : 'sub';
 
-      // Cross-team conflict check — only blocks if this add would be captain/regular
-      // and the player already holds a captain/regular slot elsewhere in this league.
-      // Subs are exempt: the same player can sub for multiple teams.
+      // Cross-team conflict check — only blocks if THIS add would be captain/regular.
+      // In that case, it blocks against ANY active membership elsewhere in the
+      // league — captain, regular, OR sub. Becoming a regular/captain is a real
+      // roster commitment; holding a sub slot elsewhere no longer makes sense
+      // once you're committed to a regular spot on a different team, so subs are
+      // not exempt here. (Subs ARE exempt from this check entirely when the add
+      // ITSELF is a sub — that's the derivedRole !== 'sub' guard below — a player
+      // can freely sub for multiple teams as long as they're not also a
+      // captain/regular anywhere.)
       if (derivedRole !== 'sub') {
         const conflictCheck = await client.query(
-          `SELECT tp.id, t.name AS team_name
+          `SELECT tp.id, tp.role, t.name AS team_name
            FROM team_players tp
            JOIN teams t ON t.id = tp.team_id
            WHERE t.league_id = $1 AND tp.player_id = $2 AND tp.left_date IS NULL
-             AND tp.team_id != $3 AND tp.role IN ('captain','regular')`,
+             AND tp.team_id != $3`,
           [id, player_id, teamId]
         );
         if (conflictCheck.rows.length > 0) {
           await client.query('ROLLBACK');
+          const cr = conflictCheck.rows[0];
+          const roleDesc = cr.role === 'sub' ? 'a sub' : (cr.role === 'captain' ? 'the captain' : 'a regular player');
           return res.status(409).json({
-            error: `Player is already on team "${conflictCheck.rows[0].team_name}" in this league`
+            error: `Player is already ${roleDesc} on team "${cr.team_name}" in this league. Remove them from that team before continuing.`
           });
         }
       }
@@ -2160,6 +2168,16 @@ app.delete('/hall/leagues/:id/teams/:teamId/players/:playerId', requireAuth, req
 // captain if it already was; it is never silently promoted as a side effect of
 // reordering players elsewhere in the list.
 //
+// Cross-team conflict guard: before any writes, check every player who is about
+// to land in a captain/regular slot (the same exclusivity rule POST add-player
+// already enforces) against their role on OTHER teams in the same league. A
+// player who is only a sub elsewhere is fine — subs are exempt from exclusivity.
+// But promoting a sub-on-another-team into a regular/captain slot here, via
+// drag or Make Captain, would silently violate the same rule that blocks it at
+// add-time — so it's checked here too, before any sort_order/role writes happen.
+// Throws an Error with a user-facing message; callers should let it propagate
+// to ROLLBACK the transaction and surface a 409.
+//
 // Two-pass write (stage through negative sort_order, then write final values):
 // the unique index on (team_id, sort_order) is checked immediately on each row's
 // UPDATE, not deferred to commit — writing final positions directly in a single
@@ -2170,12 +2188,54 @@ app.delete('/hall/leagues/:id/teams/:teamId/players/:playerId', requireAuth, req
 // guaranteed-unique negative value first avoids any such collision before the
 // second pass writes the real final positions.
 // Must be called with a `client` already inside a transaction (BEGIN done by caller).
-async function applyRosterOrder(client, teamId, playerIds, playersPerTeam, assignCaptain = false) {
+async function applyRosterOrder(client, teamId, playerIds, playersPerTeam, assignCaptain, leagueId) {
   const current = await client.query(
     `SELECT player_id, role FROM team_players WHERE team_id = $1 AND left_date IS NULL`,
     [teamId]
   );
   const currentRoleMap = new Map(current.rows.map(r => [r.player_id, r.role]));
+
+  // Precompute the role each player WILL have after this call, without writing
+  // anything yet, so we can check conflicts before touching the DB.
+  const plannedRoles = playerIds.map((pid, index) => {
+    const wasCaptain = currentRoleMap.get(pid) === 'captain';
+    let role;
+    if (index === 0 && (assignCaptain || wasCaptain)) role = 'captain';
+    else if (index < playersPerTeam) role = 'regular';
+    else role = 'sub';
+    return { pid, role };
+  });
+
+  // Conflict guard — only for players newly landing in captain/regular here.
+  // Blocks against ANY active membership elsewhere in the league (captain,
+  // regular, OR sub) — see POST add-player's identical comment for rationale:
+  // becoming a regular/captain is a real commitment, so holding a sub slot
+  // elsewhere no longer makes sense either, not just a captain/regular slot.
+  const toCheck = plannedRoles.filter(p => p.role !== 'sub').map(p => p.pid);
+  if (toCheck.length) {
+    const conflicts = await client.query(
+      `SELECT tp.player_id, tp.role, t.name AS team_name
+       FROM team_players tp
+       JOIN teams t ON t.id = tp.team_id
+       WHERE t.league_id = $1 AND tp.player_id = ANY($2::int[]) AND tp.left_date IS NULL
+         AND tp.team_id != $3`,
+      [leagueId, toCheck, teamId]
+    );
+    if (conflicts.rows.length) {
+      const row = conflicts.rows[0];
+      const player = await client.query(
+        `SELECT first_name, last_name FROM player WHERE player_id = $1`,
+        [row.player_id]
+      );
+      const pname = player.rows[0] ? `${player.rows[0].first_name} ${player.rows[0].last_name}` : 'This player';
+      const roleDesc = row.role === 'sub' ? 'a sub' : (row.role === 'captain' ? 'the captain' : 'a regular player');
+      const err = new Error(
+        `Cannot promote ${pname} to a rostered player — they are already ${roleDesc} on team "${row.team_name}". Remove them from that team before continuing.`
+      );
+      err.statusCode = 409;
+      throw err;
+    }
+  }
 
   // Pass 1: move every row to a temporary negative sort_order, unique per row,
   // guaranteed not to collide with anyone's current or future real position.
@@ -2188,17 +2248,8 @@ async function applyRosterOrder(client, teamId, playerIds, playersPerTeam, assig
 
   // Pass 2: write final sort_order + recomputed role — no collisions possible
   // now since every row currently holds a unique negative placeholder.
-  for (let index = 0; index < playerIds.length; index++) {
-    const pid = playerIds[index];
-    const wasCaptain = currentRoleMap.get(pid) === 'captain';
-    let role;
-    if (index === 0 && (assignCaptain || wasCaptain)) {
-      role = 'captain';
-    } else if (index < playersPerTeam) {
-      role = 'regular';
-    } else {
-      role = 'sub';
-    }
+  for (const { pid, role } of plannedRoles) {
+    const index = playerIds.indexOf(pid);
     await client.query(
       `UPDATE team_players SET sort_order = $1, role = $2 WHERE team_id = $3 AND player_id = $4`,
       [index, role, teamId, pid]
@@ -2254,7 +2305,7 @@ app.put('/hall/leagues/:id/teams/:teamId/players/reorder', requireAuth, requireH
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await applyRosterOrder(client, teamId, player_ids, playersPerTeam, assignCaptain);
+      await applyRosterOrder(client, teamId, player_ids, playersPerTeam, assignCaptain, id);
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK');
@@ -2274,7 +2325,7 @@ app.put('/hall/leagues/:id/teams/:teamId/players/reorder', requireAuth, requireH
     );
     res.json({ players: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
@@ -2313,7 +2364,7 @@ app.put('/hall/leagues/:id/teams/:teamId/players/:playerId/captain', requireAuth
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await applyRosterOrder(client, teamId, reordered, playersPerTeam, true);
+      await applyRosterOrder(client, teamId, reordered, playersPerTeam, true, id);
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK');
@@ -2333,7 +2384,7 @@ app.put('/hall/leagues/:id/teams/:teamId/players/:playerId/captain', requireAuth
     );
     res.json({ players: result.rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
