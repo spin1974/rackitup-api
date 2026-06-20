@@ -1989,6 +1989,7 @@ app.delete('/hall/leagues/:id/teams/:teamId', requireAuth, requireHallAdmin, asy
 
 // ── GET /hall/leagues/:id/teams/:teamId/players ───────────────────────────────
 // Fetch the current roster for a team (left_date IS NULL = active members).
+// Ordered by sort_order — position 0 is the captain slot (see role semantics below).
 app.get('/hall/leagues/:id/teams/:teamId/players', requireAuth, requireHallAuth, async (req, res) => {
   const { id, teamId } = req.params;
   try {
@@ -2001,12 +2002,12 @@ app.get('/hall/leagues/:id/teams/:teamId/players', requireAuth, requireHallAuth,
     if (check.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
 
     const result = await pool.query(
-      `SELECT tp.id, tp.player_id, tp.role, tp.joined_date,
+      `SELECT tp.id, tp.player_id, tp.role, tp.sort_order, tp.joined_date,
               p.first_name, p.last_name, p.hall_rating, p.fargo_rating, p.tier
        FROM team_players tp
        JOIN player p ON p.player_id = tp.player_id
        WHERE tp.team_id = $1 AND tp.left_date IS NULL
-       ORDER BY tp.role DESC, p.last_name, p.first_name`,
+       ORDER BY tp.sort_order`,
       [teamId]
     );
     res.json({ players: result.rows });
@@ -2016,28 +2017,32 @@ app.get('/hall/leagues/:id/teams/:teamId/players', requireAuth, requireHallAuth,
 });
 
 // ── POST /hall/leagues/:id/teams/:teamId/players ──────────────────────────────
-// Add a player to a team roster. Validates:
-//   - Player belongs to this hall
-//   - Player is not already on another team in the same league
+// Add a player to a team roster, appended to the end of the sort order.
+// Role is derived from position vs. players_per_team — never auto-assigns 'captain':
+//   position < players_per_team  → 'regular'
+//   position >= players_per_team → 'sub'
+// Cross-team exclusivity in the same league only applies to captain/regular —
+// a player can sub for multiple teams at once.
+// Position lookup + insert run inside a transaction guarded by a per-team
+// advisory lock — cheap insurance against a double-submit (e.g. a fast double
+// click) computing the same next position twice and colliding on the
+// (team_id, sort_order) unique index.
 app.post('/hall/leagues/:id/teams/:teamId/players', requireAuth, requireHallAdmin, async (req, res) => {
   const { id, teamId } = req.params;
-  const { player_id, role } = req.body;
+  const { player_id } = req.body;
   if (!player_id) return res.status(400).json({ error: 'player_id is required' });
-  const validRoles = ['regular', 'sub'];
-  const playerRole = role || 'regular';
-  if (!validRoles.includes(playerRole)) {
-    return res.status(400).json({ error: `role must be one of: ${validRoles.join(', ')}` });
-  }
 
   try {
-    // Verify team exists in this hall's league
+    // Verify team exists in this hall's league; grab players_per_team for role derivation
     const teamCheck = await pool.query(
-      `SELECT t.id FROM teams t
+      `SELECT t.id, COALESCE(l.players_per_team, 5) AS players_per_team
+       FROM teams t
        JOIN leagues l ON l.id = t.league_id
        WHERE t.id = $1 AND t.league_id = $2 AND l.poolhall_id = $3`,
       [teamId, id, req.hallId]
     );
     if (teamCheck.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
+    const playersPerTeam = +teamCheck.rows[0].players_per_team;
 
     // Verify player belongs to this hall
     const playerCheck = await pool.query(
@@ -2046,30 +2051,65 @@ app.post('/hall/leagues/:id/teams/:teamId/players', requireAuth, requireHallAdmi
     );
     if (playerCheck.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
 
-    // Check player is not already on a different team in the same league
-    const conflictCheck = await pool.query(
-      `SELECT tp.id, t.name AS team_name
-       FROM team_players tp
-       JOIN teams t ON t.id = tp.team_id
-       WHERE t.league_id = $1 AND tp.player_id = $2 AND tp.left_date IS NULL AND tp.team_id != $3`,
-      [id, player_id, teamId]
-    );
-    if (conflictCheck.rows.length > 0) {
-      return res.status(409).json({
-        error: `Player is already on team "${conflictCheck.rows[0].team_name}" in this league`
-      });
+    const client = await pool.connect();
+    let insertedPlayer;
+    try {
+      await client.query('BEGIN');
+      // Advisory lock keyed on teamId — serializes concurrent adds to the same
+      // team for the lifetime of this transaction; released automatically on
+      // COMMIT/ROLLBACK. Other teams are unaffected.
+      await client.query('SELECT pg_advisory_xact_lock($1)', [+teamId]);
+
+      const posResult = await client.query(
+        `SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_pos
+         FROM team_players WHERE team_id = $1 AND left_date IS NULL`,
+        [teamId]
+      );
+      const nextPos = +posResult.rows[0].next_pos;
+      const derivedRole = nextPos < playersPerTeam ? 'regular' : 'sub';
+
+      // Cross-team conflict check — only blocks if this add would be captain/regular
+      // and the player already holds a captain/regular slot elsewhere in this league.
+      // Subs are exempt: the same player can sub for multiple teams.
+      if (derivedRole !== 'sub') {
+        const conflictCheck = await client.query(
+          `SELECT tp.id, t.name AS team_name
+           FROM team_players tp
+           JOIN teams t ON t.id = tp.team_id
+           WHERE t.league_id = $1 AND tp.player_id = $2 AND tp.left_date IS NULL
+             AND tp.team_id != $3 AND tp.role IN ('captain','regular')`,
+          [id, player_id, teamId]
+        );
+        if (conflictCheck.rows.length > 0) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            error: `Player is already on team "${conflictCheck.rows[0].team_name}" in this league`
+          });
+        }
+      }
+
+      const result = await client.query(
+        `INSERT INTO team_players (team_id, player_id, role, sort_order, joined_date)
+         VALUES ($1, $2, $3, $4, CURRENT_DATE)
+         ON CONFLICT (team_id, player_id) DO UPDATE
+           SET left_date = NULL, role = EXCLUDED.role, sort_order = EXCLUDED.sort_order, joined_date = CURRENT_DATE
+         RETURNING id, team_id, player_id, role, sort_order, joined_date`,
+        [teamId, player_id, derivedRole, nextPos]
+      );
+      if (!result.rows.length) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Player already on this team' });
+      }
+      insertedPlayer = result.rows[0];
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
     }
 
-    const result = await pool.query(
-      `INSERT INTO team_players (team_id, player_id, role, joined_date)
-       VALUES ($1, $2, $3, CURRENT_DATE)
-       ON CONFLICT (team_id, player_id) DO UPDATE
-         SET left_date = NULL, role = EXCLUDED.role, joined_date = CURRENT_DATE
-       RETURNING id, team_id, player_id, role, joined_date`,
-      [teamId, player_id, playerRole]
-    );
-    if (!result.rows.length) return res.status(409).json({ error: 'Player already on this team' });
-    res.status(201).json({ player: result.rows[0] });
+    res.status(201).json({ player: insertedPlayer });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2077,7 +2117,8 @@ app.post('/hall/leagues/:id/teams/:teamId/players', requireAuth, requireHallAdmi
 
 // ── DELETE /hall/leagues/:id/teams/:teamId/players/:playerId ──────────────────
 // Remove a player from a team. Sets left_date rather than hard deleting,
-// preserving the record for any matches already played.
+// preserving the record for any matches already played. No auto-shift of
+// remaining sort_order positions — a gap is left until an admin reorders.
 app.delete('/hall/leagues/:id/teams/:teamId/players/:playerId', requireAuth, requireHallAdmin, async (req, res) => {
   const { id, teamId, playerId } = req.params;
   try {
@@ -2097,6 +2138,179 @@ app.delete('/hall/leagues/:id/teams/:teamId/players/:playerId', requireAuth, req
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Player not on this team' });
     res.json({ removed: true, player: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Shared helper — applyRosterOrder ───────────────────────────────────────────
+// Given a full ordered list of player_ids for a team, rewrites sort_order to match
+// that order and recomputes role for every player based on new position:
+//   index 0                          → 'captain' ONLY if assignCaptain is true,
+//                                       or if index 0's occupant already held
+//                                       'captain' before this call (preserves it
+//                                       across an unrelated reorder elsewhere)
+//   index 1 .. playersPerTeam - 1    → 'regular' (or 'captain' demoted to here
+//                                       if they were captain but assignCaptain
+//                                       is false and someone else now holds index 0)
+//   index playersPerTeam ..          → 'sub'
+// assignCaptain=true is how the Make Captain endpoint and an explicit drag-to-top
+// communicate "this index-0 occupant should become captain now." Plain reorders
+// (no captain change intended) pass assignCaptain=false — position 0 only stays
+// captain if it already was; it is never silently promoted as a side effect of
+// reordering players elsewhere in the list.
+// Must be called with a `client` already inside a transaction (BEGIN done by caller).
+async function applyRosterOrder(client, teamId, playerIds, playersPerTeam, assignCaptain = false) {
+  const current = await client.query(
+    `SELECT player_id, role FROM team_players WHERE team_id = $1 AND left_date IS NULL`,
+    [teamId]
+  );
+  const currentRoleMap = new Map(current.rows.map(r => [r.player_id, r.role]));
+
+  for (let index = 0; index < playerIds.length; index++) {
+    const pid = playerIds[index];
+    const wasCaptain = currentRoleMap.get(pid) === 'captain';
+    let role;
+    if (index === 0 && (assignCaptain || wasCaptain)) {
+      role = 'captain';
+    } else if (index < playersPerTeam) {
+      role = 'regular';
+    } else {
+      role = 'sub';
+    }
+    await client.query(
+      `UPDATE team_players SET sort_order = $1, role = $2 WHERE team_id = $3 AND player_id = $4`,
+      [index, role, teamId, pid]
+    );
+  }
+}
+
+// ── PUT /hall/leagues/:id/teams/:teamId/players/reorder ───────────────────────
+// Drag-and-drop reorder. Body: { player_ids: [12, 7, 31, 4, 9] } — the full
+// active roster for this team, in the desired new order. Rewrites sort_order
+// and recomputes captain/regular/sub for every player (see applyRosterOrder).
+app.put('/hall/leagues/:id/teams/:teamId/players/reorder', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, teamId } = req.params;
+  const { player_ids } = req.body;
+  if (!Array.isArray(player_ids) || player_ids.length === 0) {
+    return res.status(400).json({ error: 'player_ids must be a non-empty array' });
+  }
+
+  try {
+    const teamCheck = await pool.query(
+      `SELECT t.id, COALESCE(l.players_per_team, 5) AS players_per_team
+       FROM teams t
+       JOIN leagues l ON l.id = t.league_id
+       WHERE t.id = $1 AND t.league_id = $2 AND l.poolhall_id = $3`,
+      [teamId, id, req.hallId]
+    );
+    if (teamCheck.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
+    const playersPerTeam = +teamCheck.rows[0].players_per_team;
+
+    // Verify the submitted list exactly matches the team's current active roster —
+    // protects against a stale client submitting a partial or mismatched list.
+    const activeRows = await pool.query(
+      `SELECT player_id, role, sort_order FROM team_players WHERE team_id = $1 AND left_date IS NULL ORDER BY sort_order`,
+      [teamId]
+    );
+    const activeIds = new Set(activeRows.rows.map(r => r.player_id));
+    const submittedIds = new Set(player_ids);
+    if (activeIds.size !== submittedIds.size || [...activeIds].some(pid => !submittedIds.has(pid))) {
+      return res.status(409).json({ error: 'player_ids does not match the team\'s current active roster' });
+    }
+
+    // "Drag into slot 0 assigns captain" only applies when the index-0 OCCUPANT
+    // actually changed. Comparing against the previous captain (rather than the
+    // previous index-0 occupant) would misfire when no captain exists yet —
+    // any reorder that happens to leave the same person at index 0 would look
+    // like "captain changed from null to them" and wrongly promote them just
+    // for being there. Comparing against who was previously at index 0 avoids
+    // that: if they didn't move, nothing about captaincy changes.
+    const previousIndexZeroId = activeRows.rows[0]?.player_id ?? null;
+    const newIndexZeroId = player_ids[0];
+    const assignCaptain = newIndexZeroId !== previousIndexZeroId;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await applyRosterOrder(client, teamId, player_ids, playersPerTeam, assignCaptain);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const result = await pool.query(
+      `SELECT tp.id, tp.player_id, tp.role, tp.sort_order, tp.joined_date,
+              p.first_name, p.last_name, p.hall_rating, p.fargo_rating, p.tier
+       FROM team_players tp
+       JOIN player p ON p.player_id = tp.player_id
+       WHERE tp.team_id = $1 AND tp.left_date IS NULL
+       ORDER BY tp.sort_order`,
+      [teamId]
+    );
+    res.json({ players: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/leagues/:id/teams/:teamId/players/:playerId/captain ─────────────
+// Explicit "Make Captain" action. Pulls the target player to index 0 of the
+// roster (everyone else shifts down, relative order otherwise preserved),
+// demotes any previous captain, and recomputes regular/sub for anyone whose
+// position crosses the players_per_team boundary as a side effect of the shift.
+app.put('/hall/leagues/:id/teams/:teamId/players/:playerId/captain', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, teamId, playerId } = req.params;
+
+  try {
+    const teamCheck = await pool.query(
+      `SELECT t.id, COALESCE(l.players_per_team, 5) AS players_per_team
+       FROM teams t
+       JOIN leagues l ON l.id = t.league_id
+       WHERE t.id = $1 AND t.league_id = $2 AND l.poolhall_id = $3`,
+      [teamId, id, req.hallId]
+    );
+    if (teamCheck.rows.length === 0) return res.status(404).json({ error: 'Team not found' });
+    const playersPerTeam = +teamCheck.rows[0].players_per_team;
+
+    const activeRows = await pool.query(
+      `SELECT player_id FROM team_players WHERE team_id = $1 AND left_date IS NULL ORDER BY sort_order`,
+      [teamId]
+    );
+    const activeIds = activeRows.rows.map(r => r.player_id);
+    const targetId = +playerId;
+    if (!activeIds.includes(targetId)) {
+      return res.status(404).json({ error: 'Player not on this team' });
+    }
+
+    // Pull target to the front; everyone else keeps their relative order
+    const reordered = [targetId, ...activeIds.filter(pid => pid !== targetId)];
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await applyRosterOrder(client, teamId, reordered, playersPerTeam, true);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const result = await pool.query(
+      `SELECT tp.id, tp.player_id, tp.role, tp.sort_order, tp.joined_date,
+              p.first_name, p.last_name, p.hall_rating, p.fargo_rating, p.tier
+       FROM team_players tp
+       JOIN player p ON p.player_id = tp.player_id
+       WHERE tp.team_id = $1 AND tp.left_date IS NULL
+       ORDER BY tp.sort_order`,
+      [teamId]
+    );
+    res.json({ players: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
