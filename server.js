@@ -1959,6 +1959,7 @@ app.put('/hall/leagues/:id/teams/:teamId', requireAuth, requireHallAdmin, async 
     );
     res.json({ team: result.rows[0] });
   } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'A team with that name already exists in this league' });
     res.status(500).json({ error: err.message });
   }
 });
@@ -3262,8 +3263,10 @@ app.post('/hall/leagues/:id/generate-schedule', requireAuth, requireHallAdmin, a
 // least one draft to exist — an empty draft set blocks activation with a clear
 // error pointing back to the Schedule tab, rather than silently activating
 // with zero matchups.
-// Readiness gate: ≥2 teams, all teams have ≥1 player. (UI enforces ≥4 teams / full
-//   rosters; API enforces a looser minimum so manual DB fixes don't block activation.)
+// Readiness gate: ≥2 teams, all teams have ≥1 player, all teams have a captain.
+//   (UI enforces ≥4 teams / full rosters; API enforces a looser minimum so
+//   manual DB fixes don't block activation. The captain requirement is
+//   enforced at both layers identically — no looser API version of it.)
 app.post('/hall/leagues/:id/activate', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
@@ -3310,6 +3313,32 @@ app.post('/hall/leagues/:id/activate', requireAuth, requireHallAdmin, async (req
       await client.query('ROLLBACK');
       return res.status(400).json({
         error: `${emptyTeams.length} team(s) have no players: ${emptyTeams.map(t => t.name).join(', ')}`
+      });
+    }
+
+    // ── Every team must have a captain before activation ────────────────────
+    // Captaincy is deliberate, never auto-assigned (see Captain & Sub model,
+    // context_league.md) — a draft league can sit indefinitely with zero
+    // captains on some or all teams, which is fine pre-activation but not
+    // once match nights and score entry depend on a known captain per team.
+    // UI already blocks this in the Activate tab readiness check; this is
+    // the server-side backstop, same defense-in-depth pattern as the
+    // emptyTeams check above.
+    const captainRes = await client.query(
+      `SELECT t.id, t.name
+         FROM teams t
+        WHERE t.league_id = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM team_players tp
+             WHERE tp.team_id = t.id AND tp.left_date IS NULL AND tp.role = 'captain'
+          )
+        ORDER BY t.id`,
+      [id]
+    );
+    if (captainRes.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: `${captainRes.rows.length} team(s) missing a captain: ${captainRes.rows.map(t => t.name).join(', ')}`
       });
     }
 
