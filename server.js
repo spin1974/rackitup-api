@@ -3342,6 +3342,57 @@ app.post('/hall/leagues/:id/activate', requireAuth, requireHallAdmin, async (req
       });
     }
 
+    // ── Snapshot team rating totals ──────────────────────────────────────────
+    // Written for EVERY team at activation regardless of whether Team Handicap
+    // is enabled (config.team_handicap.mode) — locking the baseline now means a
+    // league that turns the handicap on later still has an accurate snapshot
+    // to anchor against, rather than one computed retroactively off whatever
+    // ratings happen to be live at that later point. Mirrors
+    // roundrobin_tournament_players.seed_rating exactly: captured once, never
+    // re-read live, doesn't drift if a player's rating changes mid-season.
+    // Captain + regular only — subs excluded, same rule as the Teams tab's
+    // Σ rating badge. See context_league.md "Team Handicap design session
+    // (2026-06-22)" for full design.
+    const ratingType = league.preferred_rating_type || 'rating';
+    const ratingColumn = ratingType === 'fargo' ? 'fargo_rating' : 'hall_rating';
+    const rosterRatingsRes = await client.query(
+      `SELECT tp.team_id, p.player_id, p.${ratingColumn} AS rating
+         FROM team_players tp
+         JOIN player p ON p.player_id = tp.player_id
+        WHERE tp.team_id = ANY($1::int[])
+          AND tp.left_date IS NULL
+          AND tp.role IN ('captain','regular')`,
+      [teams.map(t => t.id)]
+    );
+    const ratingsByTeam = {};
+    for (const row of rosterRatingsRes.rows) {
+      (ratingsByTeam[row.team_id] = ratingsByTeam[row.team_id] || []).push(row);
+    }
+    for (const team of teams) {
+      const rows = ratingsByTeam[team.id] || [];
+      // Unrated players (rating IS NULL) are excluded from both the snapshot
+      // and the total — same convention as the Teams tab's Σ badge
+      // (teamRatingTotal() in league-setup.html), which counts them separately
+      // rather than treating a missing rating as 0. A 0 would understate the
+      // team's true total no differently than just omitting the player, but
+      // it would also misrepresent that player as "rated at zero" if anyone
+      // looks at player_ratings later — omission is the honest representation.
+      const playerRatings = rows
+        .filter(r => r.rating != null)
+        .map(r => ({ player_id: r.player_id, rating: Number(r.rating) }));
+      const totalRating = playerRatings.reduce((sum, pr) => sum + pr.rating, 0);
+      await client.query(
+        `INSERT INTO league_team_rating_snapshots (league_id, team_id, rating_type, player_ratings, total_rating)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (league_id, team_id) DO UPDATE SET
+           rating_type    = EXCLUDED.rating_type,
+           player_ratings = EXCLUDED.player_ratings,
+           total_rating   = EXCLUDED.total_rating,
+           created_at     = now()`,
+        [id, team.id, ratingType, JSON.stringify(playerRatings), totalRating]
+      );
+    }
+
     // ── Generate playing dates ────────────────────────────────────────────────
     const dates = derivePlayingDates(league);
     if (dates.length === 0) {
@@ -3422,14 +3473,15 @@ app.post('/hall/leagues/:id/activate', requireAuth, requireHallAdmin, async (req
     await client.query('COMMIT');
 
     console.log(`[LEAGUE ACTIVATE] id=${id} name="${league.name}" poolhall_id=${req.hallId} ` +
-      `nights=${nightRows.length} matchups=${matchupsGenerated} schedule_type=${league.schedule_type || 'random'} ` +
-      `activated_by=user_id:${req.user.user_id}`);
+      `nights=${nightRows.length} matchups=${matchupsGenerated} rating_snapshots=${teams.length} ` +
+      `schedule_type=${league.schedule_type || 'random'} activated_by=user_id:${req.user.user_id}`);
 
     res.json({
-      league:            updatedLeague.rows[0],
-      nights_generated:  nightRows.length,
-      matchups_generated: matchupsGenerated,
-      playing_dates:     dates
+      league:               updatedLeague.rows[0],
+      nights_generated:     nightRows.length,
+      matchups_generated:   matchupsGenerated,
+      rating_snapshots_written: teams.length,
+      playing_dates:        dates
     });
 
   } catch (err) {
