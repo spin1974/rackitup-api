@@ -14,6 +14,16 @@ const LOCKOUT_MINUTES   = 30;
 const RATE_LIMIT_MAX    = 10;
 const RATE_LIMIT_WINDOW = 15 * 60 * 1000;
 
+// Public Try League score-entry routes (verify-pin, match submit, finish) get their
+// own, much more generous bucket — separate from the login limiter above. These are
+// hit by every group captain's phone at a hall over the course of a night, and —
+// because they're all on the same hall WiFi — they share one public IP via NAT.
+// A single hall-wide budget of 10/15min (same ceiling used for login brute-force
+// protection) was getting exhausted by normal concurrent use, not abuse, producing
+// "Could not submit" errors for legitimate captains.
+const RATE_LIMIT_TL_MAX    = 60;
+const RATE_LIMIT_TL_WINDOW = 15 * 60 * 1000;
+
 // ── CORS ──────────────────────────────────────────────────────────────────────
 const allowedOrigins = (process.env.ALLOWED_ORIGIN || '')
   .split(',')
@@ -51,26 +61,39 @@ const pool = new Pool({
 });
 
 // ── Rate limiter ──────────────────────────────────────────────────────────────
-const rateLimitStore = new Map();
+// Factory so unrelated routes (login vs. public Try League score entry) don't share
+// a bucket — same IP hitting one shouldn't burn down the other's budget.
+function makeRateLimiter(max, windowMs) {
+  const store = new Map();
 
-function checkRateLimit(ip) {
-  const now    = Date.now();
-  const record = rateLimitStore.get(ip);
-  if (!record || now - record.windowStart > RATE_LIMIT_WINDOW) {
-    rateLimitStore.set(ip, { count: 1, windowStart: now });
+  function check(ip) {
+    const now    = Date.now();
+    const record = store.get(ip);
+    if (!record || now - record.windowStart > windowMs) {
+      store.set(ip, { count: 1, windowStart: now });
+      return true;
+    }
+    if (record.count >= max) return false;
+    record.count++;
     return true;
   }
-  if (record.count >= RATE_LIMIT_MAX) return false;
-  record.count++;
-  return true;
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ip, record] of store.entries()) {
+      if (now - record.windowStart > windowMs) store.delete(ip);
+    }
+  }, windowMs);
+
+  return check;
 }
 
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, record] of rateLimitStore.entries()) {
-    if (now - record.windowStart > RATE_LIMIT_WINDOW) rateLimitStore.delete(ip);
-  }
-}, RATE_LIMIT_WINDOW);
+// Login brute-force protection — unchanged behaviour (10 attempts / 15 min / IP).
+const checkRateLimit = makeRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW);
+
+// Public Try League score-entry routes — separate, higher-ceiling bucket (see
+// RATE_LIMIT_TL_MAX comment above for why).
+const checkTlRateLimit = makeRateLimiter(RATE_LIMIT_TL_MAX, RATE_LIMIT_TL_WINDOW);
 
 // ── Middleware: require valid JWT ─────────────────────────────────────────────
 function requireAuth(req, res, next) {
@@ -2746,10 +2769,10 @@ app.get('/public/tryleague-sessions/:id', async (req, res) => {
 
 // ── POST /public/tryleague-sessions/:id/verify-pin ───────────────────────────
 // No auth required. Validates captain PIN against session config.
-// Rate-limited via existing checkRateLimit(). Only accepts running sessions.
+// Rate-limited via checkTlRateLimit() — separate, higher-ceiling bucket from login.
 app.post('/public/tryleague-sessions/:id/verify-pin', async (req, res) => {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-  if (!checkRateLimit(ip)) return res.status(429).json({ error: 'Too many requests' });
+  if (!checkTlRateLimit(ip)) return res.status(429).json({ error: 'Too many requests' });
 
   const { id } = req.params;
   const { pin } = req.body;
@@ -2782,7 +2805,7 @@ app.post('/public/tryleague-sessions/:id/verify-pin', async (req, res) => {
 // Session must be 'running'. PIN must match config.captain_pin.
 app.put('/public/tryleague-sessions/:id/matches/:matchId', async (req, res) => {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-  if (!checkRateLimit(ip)) return res.status(429).json({ error: 'Too many requests' });
+  if (!checkTlRateLimit(ip)) return res.status(429).json({ error: 'Too many requests' });
 
   const { id, matchId } = req.params;
   const { pin, score1, score2, winner_id } = req.body;
@@ -2948,7 +2971,7 @@ async function upsertTryLeagueStats(client, sessionId, poolhallId) {
 // Idempotent: if already finished returns 200 with no side-effects.
 app.put('/public/tryleague-sessions/:id/finish', async (req, res) => {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-  if (!checkRateLimit(ip)) return res.status(429).json({ error: 'Too many requests' });
+  if (!checkTlRateLimit(ip)) return res.status(429).json({ error: 'Too many requests' });
 
   const { id } = req.params;
   const { pin } = req.body;
