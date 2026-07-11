@@ -3633,6 +3633,360 @@ app.delete('/hall/leagues/:id/matchup-drafts/:draftId', requireAuth, requireHall
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════
+// LEAGUE MANAGEMENT (Phase 2b) — match night hub, score entry, substitutions,
+// acting captains. Operates on real league_nights / league_matchups rows
+// (post-activation). See context_league.md "Phase 2b design (2026-06-21)".
+// ══════════════════════════════════════════════════════════════════════════
+
+// GET /hall/leagues/:id/nights — list nights with matchup count + status
+app.get('/hall/leagues/:id/nights', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const leagueCheck = await pool.query(
+      `SELECT id FROM leagues WHERE id = $1 AND poolhall_id = $2`, [id, req.hallId]
+    );
+    if (leagueCheck.rows.length === 0) return res.status(404).json({ error: 'League not found' });
+
+    const result = await pool.query(
+      `SELECT n.*,
+              COUNT(m.id)::int AS matchup_count,
+              COUNT(m.id) FILTER (WHERE m.status = 'completed')::int AS completed_count
+         FROM league_nights n
+         LEFT JOIN league_matchups m ON m.league_night_id = n.id
+        WHERE n.league_id = $1
+        GROUP BY n.id
+        ORDER BY n.night_number ASC`,
+      [id]
+    );
+    res.json({ nights: result.rows });
+  } catch (err) {
+    console.error('[LEAGUE NIGHTS GET ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /hall/leagues/:id/nights/:nightId/matchups — matchups for one night, with team names
+app.get('/hall/leagues/:id/nights/:nightId/matchups', requireAuth, requireHallAuth, async (req, res) => {
+  const { id, nightId } = req.params;
+  try {
+    const nightCheck = await pool.query(
+      `SELECT id FROM league_nights WHERE id = $1 AND league_id = $2 AND poolhall_id = $3`,
+      [nightId, id, req.hallId]
+    );
+    if (nightCheck.rows.length === 0) return res.status(404).json({ error: 'Night not found' });
+
+    const result = await pool.query(
+      `SELECT m.*, ht.name AS home_team_name, at.name AS away_team_name
+         FROM league_matchups m
+         JOIN teams ht ON ht.id = m.home_team_id
+         LEFT JOIN teams at ON at.id = m.away_team_id
+        WHERE m.league_night_id = $1
+        ORDER BY m.id ASC`,
+      [nightId]
+    );
+    res.json({ matchups: result.rows });
+  } catch (err) {
+    console.error('[LEAGUE NIGHT MATCHUPS GET ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /hall/leagues/:id/nights/:nightId — update night status (scheduled/in_progress/completed)
+app.put('/hall/leagues/:id/nights/:nightId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, nightId } = req.params;
+  const { status, notes } = req.body;
+  const validStatuses = ['scheduled', 'in_progress', 'completed'];
+  if (status && !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE league_nights SET
+         status     = COALESCE($1, status),
+         notes      = COALESCE($2, notes),
+         updated_at = NOW()
+       WHERE id = $3 AND league_id = $4 AND poolhall_id = $5
+       RETURNING *`,
+      [status || null, notes != null ? notes : null, nightId, id, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Night not found' });
+    res.json({ night: result.rows[0] });
+  } catch (err) {
+    console.error('[LEAGUE NIGHT PUT ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /hall/leagues/:id/matchups/:matchupId — full detail for score entry:
+// matchup + both team rosters (active only) + current results (is_current=true)
+// + acting captains + substitutions for this matchup.
+app.get('/hall/leagues/:id/matchups/:matchupId', requireAuth, requireHallAuth, async (req, res) => {
+  const { id, matchupId } = req.params;
+  try {
+    const matchupRes = await pool.query(
+      `SELECT m.*, ht.name AS home_team_name, at.name AS away_team_name,
+              n.night_number, n.night_date
+         FROM league_matchups m
+         JOIN teams ht ON ht.id = m.home_team_id
+         LEFT JOIN teams at ON at.id = m.away_team_id
+         JOIN league_nights n ON n.id = m.league_night_id
+        WHERE m.id = $1 AND m.league_id = $2 AND m.poolhall_id = $3`,
+      [matchupId, id, req.hallId]
+    );
+    if (matchupRes.rows.length === 0) return res.status(404).json({ error: 'Matchup not found' });
+    const matchup = matchupRes.rows[0];
+
+    const teamIds = [matchup.home_team_id, matchup.away_team_id].filter(Boolean);
+    const rosterRes = await pool.query(
+      `SELECT tp.team_id, tp.role, tp.sort_order,
+              p.player_id, p.first_name, p.last_name, p.hall_rating, p.fargo_rating
+         FROM team_players tp
+         JOIN player p ON p.player_id = tp.player_id
+        WHERE tp.team_id = ANY($1::int[]) AND tp.left_date IS NULL
+        ORDER BY tp.team_id, tp.sort_order`,
+      [teamIds]
+    );
+    const homeRoster = rosterRes.rows.filter(r => r.team_id === matchup.home_team_id);
+    const awayRoster = rosterRes.rows.filter(r => r.team_id === matchup.away_team_id);
+
+    const resultsRes = await pool.query(
+      `SELECT * FROM league_matchup_results
+        WHERE league_matchup_id = $1 AND is_current = true
+        ORDER BY round_number ASC`,
+      [matchupId]
+    );
+
+    const captainsRes = await pool.query(
+      `SELECT * FROM league_match_captains WHERE league_matchup_id = $1`,
+      [matchupId]
+    );
+
+    const subsRes = await pool.query(
+      `SELECT * FROM league_match_substitutions WHERE league_matchup_id = $1`,
+      [matchupId]
+    );
+
+    res.json({
+      matchup,
+      home_roster: homeRoster,
+      away_roster: awayRoster,
+      results: resultsRes.rows,
+      acting_captains: captainsRes.rows,
+      substitutions: subsRes.rows
+    });
+  } catch (err) {
+    console.error('[LEAGUE MATCHUP DETAIL GET ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /hall/leagues/:id/matchups/:matchupId — update matchup status
+app.put('/hall/leagues/:id/matchups/:matchupId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, matchupId } = req.params;
+  const { status } = req.body;
+  const validStatuses = ['pending', 'in_progress', 'completed'];
+  if (status && !validStatuses.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE league_matchups SET
+         status     = COALESCE($1, status),
+         updated_at = NOW()
+       WHERE id = $2 AND league_id = $3 AND poolhall_id = $4
+       RETURNING *`,
+      [status || null, matchupId, id, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Matchup not found' });
+    res.json({ matchup: result.rows[0] });
+  } catch (err) {
+    console.error('[LEAGUE MATCHUP PUT ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /hall/leagues/:id/matchups/:matchupId/results — submit a round score.
+// Append-only: if a current row already exists for this (round_number,
+// home_player_id, away_player_id), it gets superseded (is_current=false,
+// superseded_by=new id) rather than overwritten in place. Phase 2 is
+// admin-only entry (entry_role always 'admin' here) — the home_captain/
+// away_captain roles and real dispute detection are Phase 3 territory, but
+// the table shape already supports it without a schema change.
+app.post('/hall/leagues/:id/matchups/:matchupId/results', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, matchupId } = req.params;
+  const { round_number, home_player_id, away_player_id, home_score, away_score } = req.body;
+
+  if (!round_number || !home_player_id || !away_player_id) {
+    return res.status(400).json({ error: 'round_number, home_player_id, and away_player_id are required' });
+  }
+  if (home_score == null || away_score == null) {
+    return res.status(400).json({ error: 'home_score and away_score are required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const matchupCheck = await client.query(
+      `SELECT id FROM league_matchups WHERE id = $1 AND league_id = $2 AND poolhall_id = $3`,
+      [matchupId, id, req.hallId]
+    );
+    if (matchupCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Matchup not found' });
+    }
+
+    // Supersede any existing current row for this exact round/pairing
+    const priorRes = await client.query(
+      `SELECT id FROM league_matchup_results
+        WHERE league_matchup_id = $1 AND round_number = $2
+          AND home_player_id = $3 AND away_player_id = $4 AND is_current = true`,
+      [matchupId, round_number, home_player_id, away_player_id]
+    );
+
+    const insertRes = await client.query(
+      `INSERT INTO league_matchup_results
+         (league_matchup_id, poolhall_id, round_number, home_player_id, away_player_id,
+          home_score, away_score, entry_role, entered_by_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'admin', $8)
+       RETURNING *`,
+      [matchupId, req.hallId, round_number, home_player_id, away_player_id,
+       home_score, away_score, req.user.user_id]
+    );
+    const newRow = insertRes.rows[0];
+
+    if (priorRes.rows.length > 0) {
+      await client.query(
+        `UPDATE league_matchup_results SET is_current = false, superseded_by = $1 WHERE id = $2`,
+        [newRow.id, priorRes.rows[0].id]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ result: newRow, superseded_prior: priorRes.rows.length > 0 });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[LEAGUE MATCHUP RESULT POST ERROR]', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /hall/leagues/:id/matchups/:matchupId/substitutions — day-of sub
+app.post('/hall/leagues/:id/matchups/:matchupId/substitutions', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, matchupId } = req.params;
+  const { team_id, rostered_player_id, sub_player_id, is_registered_sub, rating_flag_ack } = req.body;
+
+  if (!team_id || !rostered_player_id || !sub_player_id) {
+    return res.status(400).json({ error: 'team_id, rostered_player_id, and sub_player_id are required' });
+  }
+  if (parseInt(rostered_player_id) === parseInt(sub_player_id)) {
+    return res.status(400).json({ error: 'A player cannot substitute for themselves' });
+  }
+
+  try {
+    const matchupCheck = await pool.query(
+      `SELECT id, home_team_id, away_team_id FROM league_matchups WHERE id = $1 AND league_id = $2 AND poolhall_id = $3`,
+      [matchupId, id, req.hallId]
+    );
+    if (matchupCheck.rows.length === 0) return res.status(404).json({ error: 'Matchup not found' });
+    const matchup = matchupCheck.rows[0];
+    if (parseInt(team_id) !== matchup.home_team_id && parseInt(team_id) !== matchup.away_team_id) {
+      return res.status(400).json({ error: 'team_id must be one of the two teams in this matchup' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO league_match_substitutions
+         (league_matchup_id, team_id, rostered_player_id, sub_player_id,
+          is_registered_sub, rating_flag_ack, created_by_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [matchupId, team_id, rostered_player_id, sub_player_id,
+       !!is_registered_sub, !!rating_flag_ack, req.user.user_id]
+    );
+    res.json({ substitution: result.rows[0] });
+  } catch (err) {
+    console.error('[LEAGUE MATCH SUB POST ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /hall/leagues/:id/matchups/:matchupId/substitutions/:subId — undo a sub
+app.delete('/hall/leagues/:id/matchups/:matchupId/substitutions/:subId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { matchupId, subId } = req.params;
+  try {
+    const result = await pool.query(
+      `DELETE FROM league_match_substitutions WHERE id = $1 AND league_matchup_id = $2 RETURNING id`,
+      [subId, matchupId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Substitution not found' });
+    res.json({ deleted: true });
+  } catch (err) {
+    console.error('[LEAGUE MATCH SUB DELETE ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /hall/leagues/:id/matchups/:matchupId/captains — designate acting captain
+// for one team on this matchup. Upsert (one per team per matchup, enforced by
+// the UNIQUE constraint) — redesignating just overwrites the prior row.
+app.post('/hall/leagues/:id/matchups/:matchupId/captains', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, matchupId } = req.params;
+  const { team_id, acting_player_id, reason } = req.body;
+
+  if (!team_id || !acting_player_id) {
+    return res.status(400).json({ error: 'team_id and acting_player_id are required' });
+  }
+
+  try {
+    const matchupCheck = await pool.query(
+      `SELECT id, home_team_id, away_team_id FROM league_matchups WHERE id = $1 AND league_id = $2 AND poolhall_id = $3`,
+      [matchupId, id, req.hallId]
+    );
+    if (matchupCheck.rows.length === 0) return res.status(404).json({ error: 'Matchup not found' });
+    const matchup = matchupCheck.rows[0];
+    if (parseInt(team_id) !== matchup.home_team_id && parseInt(team_id) !== matchup.away_team_id) {
+      return res.status(400).json({ error: 'team_id must be one of the two teams in this matchup' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO league_match_captains
+         (league_matchup_id, team_id, acting_player_id, reason, designated_by_user_id)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (league_matchup_id, team_id) DO UPDATE SET
+         acting_player_id      = EXCLUDED.acting_player_id,
+         reason                = EXCLUDED.reason,
+         designated_by_user_id = EXCLUDED.designated_by_user_id,
+         created_at             = now()
+       RETURNING *`,
+      [matchupId, team_id, acting_player_id, reason || null, req.user.user_id]
+    );
+    res.json({ acting_captain: result.rows[0] });
+  } catch (err) {
+    console.error('[LEAGUE MATCH CAPTAIN POST ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /hall/leagues/:id/matchups/:matchupId/captains/:teamId — clear acting captain,
+// falls back to the real roster captain (team_players.role='captain')
+app.delete('/hall/leagues/:id/matchups/:matchupId/captains/:teamId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { matchupId, teamId } = req.params;
+  try {
+    const result = await pool.query(
+      `DELETE FROM league_match_captains WHERE league_matchup_id = $1 AND team_id = $2 RETURNING id`,
+      [matchupId, teamId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Acting captain designation not found' });
+    res.json({ deleted: true });
+  } catch (err) {
+    console.error('[LEAGUE MATCH CAPTAIN DELETE ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Rack It Up API running on port ${PORT}`);
