@@ -3468,8 +3468,13 @@ app.post('/hall/leagues/:id/activate', requireAuth, requireHallAdmin, async (req
     const maxDraftWeek = Math.max(...draftsRes.rows.map(d => d.week_number));
     if (maxDraftWeek > nightRows.length) {
       await client.query('ROLLBACK');
+      // v2026-06-25: reworded for clarity — leads with the likely cause (a date/
+      // skip-date change made after the schedule was built) instead of the raw
+      // week-count mismatch, and explicitly tells the admin to come back and
+      // activate again once the schedule is fixed, rather than leaving that as
+      // an implied next step.
       return res.status(409).json({
-        error: `Schedule has matchups through week ${maxDraftWeek}, but the league's current dates only produce ${nightRows.length} week${nightRows.length!==1?'s':''}. Regenerate or review the schedule in the Schedule tab — likely the date range or skip dates changed after the schedule was built.`
+        error: `This league's schedule doesn't match its current dates. The schedule has matchups through week ${maxDraftWeek}, but the start/end dates and skip dates now only produce ${nightRows.length} week${nightRows.length!==1?'s':''} — most likely because a date was changed or a skip date was added after the schedule was built. Go to the Schedule tab, regenerate (or review/fix) the schedule so it matches the current ${nightRows.length}-week range, then come back and activate the league again.`
       });
     }
 
