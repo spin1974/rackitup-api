@@ -3786,6 +3786,222 @@ app.get('/hall/leagues/:id/matchups/:matchupId', requireAuth, requireHallAuth, a
   }
 });
 
+// GET /hall/leagues/:id/standings — current cumulative standings, one row per
+// team (each team's latest league_standings row by week_number), ordered by
+// wins then total_points_for. "Current" here means whatever's been written so
+// far by applyStandingsForCompletedNight() — teams with no completed nights
+// yet simply won't appear.
+app.get('/hall/leagues/:id/standings', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const leagueCheck = await pool.query(
+      `SELECT id, win_condition FROM leagues WHERE id = $1 AND poolhall_id = $2`, [id, req.hallId]
+    );
+    if (leagueCheck.rows.length === 0) return res.status(404).json({ error: 'League not found' });
+
+    const result = await pool.query(
+      `SELECT s.*, t.name AS team_name
+         FROM league_standings s
+         JOIN teams t ON t.id = s.team_id
+         JOIN (
+           SELECT team_id, MAX(week_number) AS max_week
+             FROM league_standings
+            WHERE league_id = $1
+            GROUP BY team_id
+         ) latest ON latest.team_id = s.team_id AND latest.max_week = s.week_number
+        WHERE s.league_id = $1
+        ORDER BY s.wins DESC, s.total_points_for DESC`,
+      [id]
+    );
+    res.json({ standings: result.rows, win_condition: leagueCheck.rows[0].win_condition });
+  } catch (err) {
+    console.error('[LEAGUE STANDINGS GET ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /hall/leagues/:id/player-stats — running totals per player
+// (player_league_stats), ordered by win percentage then total points.
+app.get('/hall/leagues/:id/player-stats', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const leagueCheck = await pool.query(
+      `SELECT id FROM leagues WHERE id = $1 AND poolhall_id = $2`, [id, req.hallId]
+    );
+    if (leagueCheck.rows.length === 0) return res.status(404).json({ error: 'League not found' });
+
+    const result = await pool.query(
+      `SELECT ps.*, p.first_name, p.last_name
+         FROM player_league_stats ps
+         JOIN player p ON p.player_id = ps.player_id
+        WHERE ps.league_id = $1
+        ORDER BY ps.win_percentage DESC, ps.total_points DESC`,
+      [id]
+    );
+    res.json({ player_stats: result.rows });
+  } catch (err) {
+    console.error('[LEAGUE PLAYER STATS GET ERROR]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Team Standings / Player Stats — written automatically when a night auto-completes ──
+// Chris's decisions (2026-07-12): write a new CUMULATIVE league_standings row
+// per team the instant a night auto-completes (not a per-week-only snapshot,
+// and not a manual recompute step). 'games_won' and 'rounds_won' are treated
+// as identical — each round is already one individual game, so there's only
+// one real calculation today; both surface in the UI as "Matches Won". Only
+// 'total_points' is a genuinely different calculation (sum of raw round
+// scores instead of a count of rounds won). Ties are explicitly NOT handled
+// yet — Chris's call: with an odd round count (5 rounds/night here) a tie on
+// matches-won shouldn't actually occur, so this is deferred rather than
+// designed around now. A tied night simply doesn't add a win or a loss for
+// either team; points still accumulate normally.
+
+// Determines whether a single matchup went to the home or away team
+// (true/false), or null if genuinely tied (deferred case above).
+function determineMatchupWinner(winCondition, homeMatchesWon, awayMatchesWon, homePoints, awayPoints) {
+  if (winCondition === 'total_points') {
+    if (homePoints > awayPoints) return true;
+    if (awayPoints > homePoints) return false;
+    return null;
+  }
+  // 'games_won' and 'rounds_won' — identical calculation, see note above
+  if (homeMatchesWon > awayMatchesWon) return true;
+  if (awayMatchesWon > homeMatchesWon) return false;
+  return null;
+}
+
+// Writes one cumulative league_standings row for a team for this week,
+// built from whatever their most recent prior row was (any earlier
+// week_number for this team), plus this night's delta. ON CONFLICT guards
+// against a genuine double-call for the same (league,team,week) rather than
+// erroring or silently doubling the totals.
+async function upsertCumulativeStanding(client, leagueId, teamId, weekNumber, won, lost, pointsFor, pointsAgainst) {
+  const priorRes = await client.query(
+    `SELECT wins, losses, total_points_for, total_points_against
+       FROM league_standings
+      WHERE league_id = $1 AND team_id = $2 AND week_number < $3
+      ORDER BY week_number DESC LIMIT 1`,
+    [leagueId, teamId, weekNumber]
+  );
+  const prior = priorRes.rows[0] || { wins: 0, losses: 0, total_points_for: 0, total_points_against: 0 };
+
+  const newWins    = prior.wins    + (won ? 1 : 0);
+  const newLosses  = prior.losses  + (lost ? 1 : 0);
+  const newFor     = prior.total_points_for     + pointsFor;
+  const newAgainst = prior.total_points_against + pointsAgainst;
+
+  await client.query(
+    `INSERT INTO league_standings
+       (league_id, team_id, week_number, wins, losses, total_points_for, total_points_against, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+     ON CONFLICT (league_id, team_id, week_number) DO UPDATE SET
+       wins = $4, losses = $5, total_points_for = $6, total_points_against = $7, updated_at = NOW()`,
+    [leagueId, teamId, weekNumber, newWins, newLosses, newFor, newAgainst]
+  );
+}
+
+// Writes/updates one player_league_stats row — running totals, no week
+// dimension (matches the table's existing shape). Called once per player per
+// round result. "games_played"/"games_won" here are individual round
+// wins/losses — always a plain win/loss regardless of the league's
+// win_condition, which only governs how the NIGHT's team winner is derived.
+async function upsertPlayerStat(client, leagueId, playerId, points, won) {
+  const priorRes = await client.query(
+    `SELECT games_played, games_won, total_points FROM player_league_stats
+      WHERE league_id = $1 AND player_id = $2`,
+    [leagueId, playerId]
+  );
+  const prior = priorRes.rows[0] || { games_played: 0, games_won: 0, total_points: 0 };
+
+  const gamesPlayed = prior.games_played + 1;
+  const gamesWon    = prior.games_won + (won ? 1 : 0);
+  const totalPoints = prior.total_points + points;
+  const winPct = gamesPlayed > 0 ? (gamesWon / gamesPlayed) * 100 : 0;
+  const avgPts = gamesPlayed > 0 ? totalPoints / gamesPlayed : 0;
+
+  await client.query(
+    `INSERT INTO player_league_stats
+       (league_id, player_id, games_played, games_won, total_points, win_percentage, avg_points_per_game, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+     ON CONFLICT (league_id, player_id) DO UPDATE SET
+       games_played = $3, games_won = $4, total_points = $5,
+       win_percentage = $6, avg_points_per_game = $7, updated_at = NOW()`,
+    [leagueId, playerId, gamesPlayed, gamesWon, totalPoints, winPct.toFixed(2), avgPts.toFixed(2)]
+  );
+}
+
+// Top-level: called once, right when a night transitions to 'completed' for
+// the first time. Computes each non-bye matchup's result and writes both the
+// team-level standings row and every involved player's stat row, all in one
+// transaction so a partial failure doesn't leave standings and player stats
+// disagreeing with each other.
+async function applyStandingsForCompletedNight(leagueId, nightId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const leagueRes = await client.query(`SELECT win_condition FROM leagues WHERE id = $1`, [leagueId]);
+    const winCondition = (leagueRes.rows[0] && leagueRes.rows[0].win_condition) || 'games_won';
+
+    const nightRes = await client.query(`SELECT night_number FROM league_nights WHERE id = $1`, [nightId]);
+    const weekNumber = nightRes.rows[0].night_number;
+
+    const matchupsRes = await client.query(
+      `SELECT id, home_team_id, away_team_id FROM league_matchups
+        WHERE league_night_id = $1 AND is_bye = false`,
+      [nightId]
+    );
+
+    for (const m of matchupsRes.rows) {
+      const resultsRes = await client.query(
+        `SELECT home_player_id, away_player_id, home_score, away_score
+           FROM league_matchup_results
+          WHERE league_matchup_id = $1 AND is_current = true`,
+        [m.id]
+      );
+      const results = resultsRes.rows;
+      if (results.length === 0) continue; // nothing recorded for this matchup — defensive, shouldn't happen if it was actually marked completed
+
+      let homeMatchesWon = 0, awayMatchesWon = 0, homePoints = 0, awayPoints = 0;
+      for (const r of results) {
+        homePoints += r.home_score;
+        awayPoints += r.away_score;
+        if (r.home_score > r.away_score) homeMatchesWon++;
+        else if (r.away_score > r.home_score) awayMatchesWon++;
+      }
+
+      const homeWonNight = determineMatchupWinner(winCondition, homeMatchesWon, awayMatchesWon, homePoints, awayPoints);
+
+      await upsertCumulativeStanding(
+        client, leagueId, m.home_team_id, weekNumber,
+        homeWonNight === true, homeWonNight === false, homePoints, awayPoints
+      );
+      await upsertCumulativeStanding(
+        client, leagueId, m.away_team_id, weekNumber,
+        homeWonNight === false, homeWonNight === true, awayPoints, homePoints
+      );
+
+      for (const r of results) {
+        await upsertPlayerStat(client, leagueId, r.home_player_id, r.home_score, r.home_score > r.away_score);
+        await upsertPlayerStat(client, leagueId, r.away_player_id, r.away_score, r.away_score > r.home_score);
+      }
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[STANDINGS AUTO-WRITE ERROR]', err);
+    // Intentionally swallowed — the matchup/night status update itself already
+    // succeeded and has already been returned to the client by the time this
+    // runs; a standings-write failure shouldn't turn a successful "mark
+    // complete" action into an error response. Logged for follow-up instead.
+  } finally {
+    client.release();
+  }
+}
+
 // PUT /hall/leagues/:id/matchups/:matchupId — update matchup status
 app.put('/hall/leagues/:id/matchups/:matchupId', requireAuth, requireHallAdmin, async (req, res) => {
   const { id, matchupId } = req.params;
@@ -3804,7 +4020,45 @@ app.put('/hall/leagues/:id/matchups/:matchupId', requireAuth, requireHallAdmin, 
       [status || null, matchupId, id, req.hallId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Matchup not found' });
-    res.json({ matchup: result.rows[0] });
+    const matchup = result.rows[0];
+
+    // Auto-complete the night once every real (non-bye) matchup in it is
+    // done — previously nothing ever touched league_nights.status after
+    // activation, so nights sat at 'scheduled' forever even once fully
+    // played, which read as wrong in both the Match Nights and History tabs.
+    // Bye rows are excluded from the check since they're never individually
+    // marked complete (nothing to score). Forward-only: this doesn't revert
+    // the night's status if a matchup is later un-completed — no UI path
+    // does that today, so not handling it avoids solving a problem that
+    // doesn't exist yet.
+    //
+    // The RETURNING id on the night UPDATE is load-bearing: without it, a
+    // second PUT against an already-completed matchup (e.g. an accidental
+    // double-click, or a retried request) would re-satisfy "remaining === 0"
+    // and fire nightAutoCompleted a second time, double-writing standings for
+    // the same week. Only an ACTUAL scheduled→completed transition counts.
+    let nightAutoCompleted = false;
+    if (matchup.status === 'completed' && matchup.league_night_id) {
+      const remaining = await pool.query(
+        `SELECT COUNT(*)::int AS remaining FROM league_matchups
+          WHERE league_night_id = $1 AND is_bye = false AND status <> 'completed'`,
+        [matchup.league_night_id]
+      );
+      if (remaining.rows[0].remaining === 0) {
+        const nightUpdateRes = await pool.query(
+          `UPDATE league_nights SET status = 'completed', updated_at = NOW()
+            WHERE id = $1 AND status <> 'completed'
+            RETURNING id`,
+          [matchup.league_night_id]
+        );
+        if (nightUpdateRes.rows.length > 0) {
+          nightAutoCompleted = true;
+          await applyStandingsForCompletedNight(id, matchup.league_night_id);
+        }
+      }
+    }
+
+    res.json({ matchup, night_auto_completed: nightAutoCompleted });
   } catch (err) {
     console.error('[LEAGUE MATCHUP PUT ERROR]', err);
     res.status(500).json({ error: err.message });
