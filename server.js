@@ -3903,21 +3903,37 @@ async function upsertCumulativeStanding(client, leagueId, teamId, weekNumber, wo
 }
 
 // Writes/updates one player_league_stats row — running totals, no week
-// dimension (matches the table's existing shape). Called once per player per
-// round result. "games_played"/"games_won" here are individual round
-// wins/losses — always a plain win/loss regardless of the league's
+// dimension (matches the table's existing shape).
+//
+// v0.2.x (2026-07-14): rewritten from an incremental "add onto whatever's
+// already there" pattern to a full recompute FROM league_matchup_results
+// every time it's called. This is the fix for a real gap Chris hit: editing
+// a score on a matchup whose night was ALREADY completed saved the
+// corrected result row fine (append-only, superseded correctly), but the
+// old incremental version had no way to "undo" the stale prior addition
+// without double-counting if simply re-run. A full recompute has no such
+// problem — it's idempotent no matter how many times or when it's called,
+// which is what makes it safe to trigger again from a later correction (see
+// the POST /results handler below), not just from the one-time night
+// auto-complete transition. "games_played"/"games_won" here are individual
+// round wins/losses — always a plain win/loss regardless of the league's
 // win_condition, which only governs how the NIGHT's team winner is derived.
-async function upsertPlayerStat(client, leagueId, playerId, points, won) {
-  const priorRes = await client.query(
-    `SELECT games_played, games_won, total_points FROM player_league_stats
-      WHERE league_id = $1 AND player_id = $2`,
+async function recomputePlayerStat(client, leagueId, playerId) {
+  const aggRes = await client.query(
+    `SELECT
+       COUNT(*)::int AS games_played,
+       COUNT(*) FILTER (
+         WHERE (lmr.home_player_id = $2 AND lmr.home_score > lmr.away_score)
+            OR (lmr.away_player_id = $2 AND lmr.away_score > lmr.home_score)
+       )::int AS games_won,
+       COALESCE(SUM(CASE WHEN lmr.home_player_id = $2 THEN lmr.home_score ELSE lmr.away_score END), 0)::int AS total_points
+     FROM league_matchup_results lmr
+     JOIN league_matchups lm ON lm.id = lmr.league_matchup_id
+     WHERE lm.league_id = $1 AND lmr.is_current = true
+       AND (lmr.home_player_id = $2 OR lmr.away_player_id = $2)`,
     [leagueId, playerId]
   );
-  const prior = priorRes.rows[0] || { games_played: 0, games_won: 0, total_points: 0 };
-
-  const gamesPlayed = prior.games_played + 1;
-  const gamesWon    = prior.games_won + (won ? 1 : 0);
-  const totalPoints = prior.total_points + points;
+  const { games_played: gamesPlayed, games_won: gamesWon, total_points: totalPoints } = aggRes.rows[0];
   const winPct = gamesPlayed > 0 ? (gamesWon / gamesPlayed) * 100 : 0;
   const avgPts = gamesPlayed > 0 ? totalPoints / gamesPlayed : 0;
 
@@ -3932,11 +3948,18 @@ async function upsertPlayerStat(client, leagueId, playerId, points, won) {
   );
 }
 
-// Top-level: called once, right when a night transitions to 'completed' for
-// the first time. Computes each non-bye matchup's result and writes both the
-// team-level standings row and every involved player's stat row, all in one
-// transaction so a partial failure doesn't leave standings and player stats
-// disagreeing with each other.
+// Called when a night first transitions to 'completed' (from PUT
+// /matchups/:matchupId), AND again any time a score is CORRECTED on a
+// matchup whose night is already completed (from POST /results — see
+// 2026-07-14 fix). Safe to call repeatedly for the same night: both the
+// standings write (upsertCumulativeStanding, recomputes each team's week-N
+// row from prior weeks + this night's freshly-computed delta) and the
+// player-stats write (recomputePlayerStat, full aggregate from
+// league_matchup_results) fully recompute rather than incrementally add, so
+// re-running never double-counts. Computes each non-bye matchup's result and
+// writes both the team-level standings row and every involved player's stat
+// row, all in one transaction so a partial failure doesn't leave standings
+// and player stats disagreeing with each other.
 async function applyStandingsForCompletedNight(leagueId, nightId) {
   const client = await pool.connect();
   try {
@@ -3984,8 +4007,8 @@ async function applyStandingsForCompletedNight(leagueId, nightId) {
       );
 
       for (const r of results) {
-        await upsertPlayerStat(client, leagueId, r.home_player_id, r.home_score, r.home_score > r.away_score);
-        await upsertPlayerStat(client, leagueId, r.away_player_id, r.away_score, r.away_score > r.home_score);
+        await recomputePlayerStat(client, leagueId, r.home_player_id);
+        await recomputePlayerStat(client, leagueId, r.away_player_id);
       }
     }
 
@@ -4080,6 +4103,10 @@ app.put('/hall/leagues/:id/matchups/:matchupId', requireAuth, requireHallAdmin, 
 // admin-only entry (entry_role always 'admin' here) — the home_captain/
 // away_captain roles and real dispute detection are Phase 3 territory, but
 // the table shape already supports it without a schema change.
+// 2026-07-14: if this matchup's night is already 'completed' (a correction
+// after the fact, not the original entry), also re-runs
+// applyStandingsForCompletedNight() so Team Standings/Player Stats pick up
+// the change — see that function's comment for why re-running it is safe.
 app.post('/hall/leagues/:id/matchups/:matchupId/results', requireAuth, requireHallAdmin, async (req, res) => {
   const { id, matchupId } = req.params;
   const { round_number, home_player_id, away_player_id, home_score, away_score } = req.body;
@@ -4092,17 +4119,19 @@ app.post('/hall/leagues/:id/matchups/:matchupId/results', requireAuth, requireHa
   }
 
   const client = await pool.connect();
+  let leagueNightId = null;
   try {
     await client.query('BEGIN');
 
     const matchupCheck = await client.query(
-      `SELECT id FROM league_matchups WHERE id = $1 AND league_id = $2 AND poolhall_id = $3`,
+      `SELECT id, league_night_id FROM league_matchups WHERE id = $1 AND league_id = $2 AND poolhall_id = $3`,
       [matchupId, id, req.hallId]
     );
     if (matchupCheck.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Matchup not found' });
     }
+    leagueNightId = matchupCheck.rows[0].league_night_id;
 
     // Supersede any existing current row for this exact round/pairing
     const priorRes = await client.query(
@@ -4131,7 +4160,28 @@ app.post('/hall/leagues/:id/matchups/:matchupId/results', requireAuth, requireHa
     }
 
     await client.query('COMMIT');
-    res.json({ result: newRow, superseded_prior: priorRes.rows.length > 0 });
+
+    // v0.2.x (2026-07-14): if this matchup's night was ALREADY completed
+    // before this submission — i.e. this is a CORRECTION to a score entered
+    // after the night auto-completed, not the initial entry — re-run the
+    // standings/player-stats write for that night so the correction actually
+    // propagates. Before this fix, a correction saved fine (append-only,
+    // superseded correctly) but Team Standings/Player Stats silently went
+    // stale, since applyStandingsForCompletedNight() only ever fired once,
+    // at the scheduled→completed transition. Safe to call again now that
+    // both writers fully recompute rather than incrementally add (see their
+    // comments). Checked and run AFTER commit, outside the main transaction
+    // — same pattern the PUT /matchups/:matchupId auto-complete path uses.
+    let standingsRecomputed = false;
+    if (leagueNightId) {
+      const nightCheck = await pool.query(`SELECT status FROM league_nights WHERE id = $1`, [leagueNightId]);
+      if (nightCheck.rows[0] && nightCheck.rows[0].status === 'completed') {
+        standingsRecomputed = true;
+        await applyStandingsForCompletedNight(id, leagueNightId);
+      }
+    }
+
+    res.json({ result: newRow, superseded_prior: priorRes.rows.length > 0, standings_recomputed: standingsRecomputed });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('[LEAGUE MATCHUP RESULT POST ERROR]', err);
