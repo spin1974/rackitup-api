@@ -9,6 +9,11 @@ const app        = express();
 const PORT       = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
 
+// Captured once at process start — used by GET /admin/version (siteadmin/version.html)
+// to show "this instance has been running since X", alongside Render's own
+// RENDER_GIT_COMMIT/RENDER_GIT_BRANCH env vars for the actual deployed commit.
+const SERVER_STARTED_AT = new Date();
+
 const LOCKOUT_ATTEMPTS  = 3;
 const LOCKOUT_MINUTES   = 30;
 const RATE_LIMIT_MAX    = 10;
@@ -301,6 +306,26 @@ app.put('/auth/change-password', requireAuth, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 // SITE ADMIN ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// GET /admin/version — lets a site admin confirm exactly which commit of
+// server.js is actually live, without needing to trust that a commit/deploy
+// "took." Reads RENDER_GIT_COMMIT/RENDER_GIT_BRANCH, which Render sets
+// automatically at build+runtime for every deploy — this is deliberately NOT
+// a manually-maintained VERSION constant like the frontend files use, since
+// that depends on remembering to bump it and can drift from what's actually
+// deployed. Falls back to 'local' values when run outside Render (e.g. local
+// dev), so this endpoint doesn't error out in that environment.
+app.get('/admin/version', requireAuth, requireSiteAdmin, async (req, res) => {
+  res.json({
+    git_commit:       process.env.RENDER_GIT_COMMIT || null,
+    git_branch:       process.env.RENDER_GIT_BRANCH || null,
+    service_name:     process.env.RENDER_SERVICE_NAME || null,
+    instance_id:      process.env.RENDER_INSTANCE_ID || null,
+    is_render:        process.env.RENDER === 'true',
+    node_version:     process.version,
+    server_started_at: SERVER_STARTED_AT.toISOString(),
+  });
+});
 
 app.get('/admin/stats', requireAuth, requireSiteAdmin, async (req, res) => {
   try {
