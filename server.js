@@ -4044,7 +4044,15 @@ app.put('/hall/leagues/:id/matchups/:matchupId', requireAuth, requireHallAdmin, 
           WHERE league_night_id = $1 AND is_bye = false AND status <> 'completed'`,
         [matchup.league_night_id]
       );
-      if (remaining.rows[0].remaining === 0) {
+      // Number(...) coercion is load-bearing here, not decorative: confirmed
+      // via live testing (2026-07-14) that this check can silently never
+      // fire even when the true remaining count is 0 — a strict `=== 0`
+      // comparison fails if pg hands back the COUNT() result as a string
+      // rather than a JS number (a known pg/node-postgres footgun depending
+      // on how the driver's type parsing is configured), regardless of the
+      // ::int cast in the query above. Coercing explicitly here removes the
+      // ambiguity instead of depending on the cast alone.
+      if (Number(remaining.rows[0].remaining) === 0) {
         const nightUpdateRes = await pool.query(
           `UPDATE league_nights SET status = 'completed', updated_at = NOW()
             WHERE id = $1 AND status <> 'completed'
