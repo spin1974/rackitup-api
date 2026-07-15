@@ -2906,8 +2906,11 @@ app.put('/public/tryleague-sessions/:id/matches/:matchId', async (req, res) => {
 // Accepts a pg client (for transaction support), sessionId, and poolhallId.
 async function upsertTryLeagueStats(client, sessionId, poolhallId) {
   // Fetch all scored matches for this session.
-  // Rotate matches: W/L counted for the non-double player only (identified at runtime).
-  // Points: rotate matches excluded entirely from personal stats — only non-rotate matches count.
+  // Rotate matches: W/L AND points counted for the non-double player only
+  // (identified at runtime) — fixed 2026-07-14. Previously points were
+  // excluded entirely from rotate matches for both players; confirmed
+  // against reports/try-league.html's correct live behavior that the
+  // non-double player's own score should count same as a normal match.
   const matches = await client.query(
     `SELECT p1_id, p2_id, winner_id, is_rotate, score1, score2
      FROM tryleague_matches
@@ -2939,13 +2942,18 @@ async function upsertTryLeagueStats(client, sessionId, poolhallId) {
 
     if (m.is_rotate) {
       // The rotate double is whichever player also appears in normal matches.
-      // Count W/L for the non-double player only. Points excluded for both on rotate matches.
-      const doubleId   = normalMatchPlayerIds.has(m.p1_id) ? m.p1_id : m.p2_id;
+      // Count W/L AND points for the non-double player only, using their own
+      // score — same as a normal match. The double already got personal
+      // credit from their normal match this round, so they get nothing from
+      // this row.
+      const doubleId    = normalMatchPlayerIds.has(m.p1_id) ? m.p1_id : m.p2_id;
       const nonDoubleId = m.p1_id === doubleId ? m.p2_id : m.p1_id;
+      const nonDoubleWon   = m.winner_id === nonDoubleId;
+      const nonDoubleScore = nonDoubleId === m.p1_id ? m.score1 : m.score2;
       ensure(nonDoubleId);
-      if (m.winner_id === nonDoubleId) statsMap.get(nonDoubleId).wins   += 1;
-      else                             statsMap.get(nonDoubleId).losses  += 1;
-      // No points for rotate matches
+      if (nonDoubleWon) statsMap.get(nonDoubleId).wins   += 1;
+      else              statsMap.get(nonDoubleId).losses += 1;
+      statsMap.get(nonDoubleId).points += nonDoubleScore;
     } else {
       ensure(winnerId);
       ensure(loserId);
