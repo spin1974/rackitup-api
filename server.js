@@ -902,6 +902,65 @@ app.get('/hall/tournaments', requireAuth, requireHallAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// EVENT TAGS — Try League tag system Phase 1 (see context_tags_tl.md)
+// Module-neutral table (event_tags), shared by future modules; attachment goes
+// through a per-module join table with a real FK — Try League's is
+// try_league_event_tags, wired below alongside the Try League routes.
+// Tags attach to events only. There is no player-tag relationship — do not add one.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+app.get('/hall/event-tags', requireAuth, requireHallAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, poolhall_id, name, is_active, created_at, created_by
+       FROM event_tags WHERE poolhall_id = $1 ORDER BY name ASC`,
+      [req.hallId]
+    );
+    res.json({ tags: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/hall/event-tags', requireAuth, requireHallAdmin, async (req, res) => {
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'name is required' });
+  try {
+    const result = await pool.query(
+      `INSERT INTO event_tags (poolhall_id, name, is_active, created_by)
+       VALUES ($1, $2, true, $3)
+       RETURNING id, poolhall_id, name, is_active, created_at, created_by`,
+      [req.hallId, name.trim(), req.user.user_id]
+    );
+    res.status(201).json({ tag: result.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'A tag with this name already exists' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Rename and/or archive/restore (is_active). No hard delete — tags are archived,
+// never removed, so historical events keep a stable label.
+app.put('/hall/event-tags/:id', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { name, is_active } = req.body;
+  if (name !== undefined && !name.trim()) return res.status(400).json({ error: 'name cannot be blank' });
+  try {
+    const result = await pool.query(
+      `UPDATE event_tags SET name = COALESCE($1, name), is_active = COALESCE($2, is_active)
+       WHERE id = $3 AND poolhall_id = $4
+       RETURNING id, poolhall_id, name, is_active, created_at, created_by`,
+      [name ? name.trim() : null, is_active === undefined ? null : is_active, id, req.hallId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tag not found' });
+    res.json({ tag: result.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'A tag with this name already exists' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // CHIP TOURNAMENT ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2599,6 +2658,81 @@ app.put('/hall/tryleague-sessions/:id/pin', requireAuth, requireHallAdmin, async
     res.json({ session: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/tryleague-sessions/:id/tags ────────────────────────────────────
+app.get('/hall/tryleague-sessions/:id/tags', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const own = await pool.query(
+      `SELECT session_id FROM tryleague_sessions WHERE session_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (own.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+    const result = await pool.query(
+      `SELECT et.id, et.name, et.is_active
+       FROM try_league_event_tags tlet
+       JOIN event_tags et ON et.id = tlet.tag_id
+       WHERE tlet.event_id = $1
+       ORDER BY et.name ASC`,
+      [id]
+    );
+    res.json({ tags: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/tryleague-sessions/:id/tags ────────────────────────────────────
+// Full replace — body: { tag_ids: [...] }. No status restriction — tags can be
+// set/changed at any point in the event's lifecycle.
+app.put('/hall/tryleague-sessions/:id/tags', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const tagIds = Array.isArray(req.body.tag_ids) ? req.body.tag_ids : [];
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const own = await client.query(
+      `SELECT session_id FROM tryleague_sessions WHERE session_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (own.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    if (tagIds.length > 0) {
+      const validTags = await client.query(
+        `SELECT id FROM event_tags WHERE poolhall_id = $1 AND id = ANY($2::int[])`,
+        [req.hallId, tagIds]
+      );
+      if (validTags.rows.length !== tagIds.length) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'One or more tag_ids are invalid for this hall' });
+      }
+    }
+    await client.query(`DELETE FROM try_league_event_tags WHERE event_id = $1`, [id]);
+    for (const tagId of tagIds) {
+      await client.query(
+        `INSERT INTO try_league_event_tags (event_id, tag_id) VALUES ($1, $2)`,
+        [id, tagId]
+      );
+    }
+    const result = await client.query(
+      `SELECT et.id, et.name, et.is_active
+       FROM try_league_event_tags tlet
+       JOIN event_tags et ON et.id = tlet.tag_id
+       WHERE tlet.event_id = $1
+       ORDER BY et.name ASC`,
+      [id]
+    );
+    await client.query('COMMIT');
+    res.json({ tags: result.rows });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
