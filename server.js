@@ -141,6 +141,27 @@ function requireHallAdmin(req, res, next) {
   next();
 }
 
+// ── Event audit log helper ─────────────────────────────────────────────────────
+// Writes to the generic event_audit_log table (see migrations/2026-08-16_event_audit_log.sql).
+// Accepts either `pool` or an in-transaction `client` as dbClient so callers already inside a
+// BEGIN/COMMIT block can log atomically with the action itself.
+// Never throws — a logging failure must not break the primary action it's describing.
+async function logEventAudit(dbClient, { poolhallId, eventType, eventId, action, req, snapshot, detail }) {
+  try {
+    const performedByUserId = (req && req.user) ? req.user.user_id : null;
+    const performedByRole   = (req && req.user) ? req.user.role_name : null;
+    await dbClient.query(
+      `INSERT INTO event_audit_log
+         (poolhall_id, event_type, event_id, action, performed_by_user_id, performed_by_role, snapshot, detail)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [poolhallId, eventType, eventId, action, performedByUserId, performedByRole,
+       snapshot ? JSON.stringify(snapshot) : null, detail ? JSON.stringify(detail) : null]
+    );
+  } catch (err) {
+    console.error('[event_audit_log] insert failed:', err.message);
+  }
+}
+
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -660,6 +681,36 @@ app.delete('/admin/db/tryleague-sessions/:id', requireAuth, requireSiteAdmin, as
     await pool.query(`DELETE FROM tryleague_sessions WHERE session_id = $1`, [id]);
     console.log(`[ADMIN DELETE] tryleague session_id=${s.session_id} name="${s.name}" hall="${s.poolhall_name}" status=${s.status} deleted_by=user_id:${req.user.user_id}`);
     res.json({ deleted: true, session_id: s.session_id, name: s.name });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /admin/event-audit-log ────────────────────────────────────────────────
+// Site-admin, unscoped. Unlike the hall-scoped version, identity is never masked —
+// site admins can see exactly who (including other site admins) performed each action.
+// Optional filters: poolhall_id, event_type.
+app.get('/admin/event-audit-log', requireAuth, requireSiteAdmin, async (req, res) => {
+  const { poolhall_id, event_type } = req.query;
+  const params = [];
+  const clauses = [];
+  if (poolhall_id) { params.push(poolhall_id); clauses.push(`eal.poolhall_id = $${params.length}`); }
+  if (event_type)  { params.push(event_type);  clauses.push(`eal.event_type = $${params.length}`); }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  try {
+    const result = await pool.query(
+      `SELECT eal.id, eal.poolhall_id, ph.poolhall_name, eal.event_type, eal.event_id, eal.action,
+              eal.performed_by_role, eal.snapshot, eal.detail, eal.created_at,
+              CASE WHEN eal.performed_by_user_id IS NULL THEN 'Public (PIN entry)' ELSE u.user_name END AS performed_by_label
+       FROM event_audit_log eal
+       LEFT JOIN users u ON u.user_id = eal.performed_by_user_id
+       LEFT JOIN poolhall ph ON ph.poolhall_id = eal.poolhall_id
+       ${where}
+       ORDER BY eal.created_at DESC
+       LIMIT 300`,
+      params
+    );
+    res.json({ logs: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2465,7 +2516,12 @@ app.post('/hall/tryleague-sessions', requireAuth, requireHallAdmin, async (req, 
        RETURNING session_id, poolhall_id, name, status, config, created_at`,
       [req.hallId, name || null, config ? JSON.stringify(config) : JSON.stringify({})]
     );
-    res.status(201).json({ session: result.rows[0] });
+    const session = result.rows[0];
+    await logEventAudit(pool, {
+      poolhallId: req.hallId, eventType: 'try_league', eventId: session.session_id,
+      action: 'created', req, snapshot: session
+    });
+    res.status(201).json({ session });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2503,6 +2559,13 @@ app.put('/hall/tryleague-sessions/:id', requireAuth, requireHallAdmin, async (re
       );
       if (status === 'finished' && !wasAlreadyFinished) {
         await upsertTryLeagueStats(client, id, row.poolhall_id);
+      }
+      if (status && status !== row.status) {
+        await logEventAudit(client, {
+          poolhallId: req.hallId, eventType: 'try_league', eventId: id,
+          action: 'status_change', req, snapshot: result.rows[0],
+          detail: { old_status: row.status, new_status: status }
+        });
       }
       await client.query('COMMIT');
       res.json({ session: result.rows[0] });
@@ -2544,16 +2607,83 @@ app.delete('/hall/tryleague-sessions/:id', requireAuth, requireHallAdmin, async 
   const { id } = req.params;
   try {
     const check = await pool.query(
-      `SELECT session_id, status FROM tryleague_sessions WHERE session_id = $1 AND poolhall_id = $2`,
+      `SELECT session_id, poolhall_id, name, status, config, created_at, started_at, finished_at
+       FROM tryleague_sessions WHERE session_id = $1 AND poolhall_id = $2`,
       [id, req.hallId]
     );
     if (check.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
+    const session = check.rows[0];
+
+    // Capture counts + roster BEFORE the delete cascades them away — this is the only chance
+    // to record what was actually lost.
+    const counts = await pool.query(
+      `SELECT
+         (SELECT COUNT(*) FROM tryleague_session_players WHERE session_id = $1) AS player_count,
+         (SELECT COUNT(*) FROM tryleague_matches WHERE session_id = $1) AS match_count,
+         (SELECT COUNT(*) FROM tryleague_matches WHERE session_id = $1 AND status = 'done') AS matches_done`,
+      [id]
+    );
+    const roster = await pool.query(
+      `SELECT p.first_name, p.last_name
+       FROM tryleague_session_players tsp JOIN player p ON p.player_id = tsp.player_id
+       WHERE tsp.session_id = $1`,
+      [id]
+    );
+
     // No status restriction — hall_admin can hard-delete any session (cascades to players + matches)
     const result = await pool.query(
       `DELETE FROM tryleague_sessions WHERE session_id = $1 AND poolhall_id = $2 RETURNING session_id, name`,
       [id, req.hallId]
     );
+
+    await logEventAudit(pool, {
+      poolhallId: req.hallId, eventType: 'try_league', eventId: id, action: 'deleted', req,
+      snapshot: session,
+      detail: {
+        player_count: parseInt(counts.rows[0].player_count, 10),
+        match_count: parseInt(counts.rows[0].match_count, 10),
+        matches_done: parseInt(counts.rows[0].matches_done, 10),
+        roster: roster.rows.map(r => `${r.first_name} ${r.last_name}`)
+      }
+    });
+
     res.json({ message: 'Session deleted', session: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /hall/event-audit-log ─────────────────────────────────────────────────
+// Hall-scoped audit log viewer. Any action performed by a site_admin (e.g. via the
+// /admin/db/tryleague-sessions/:id orphan-cleanup route) is shown with the identity
+// masked to "Site Admin" — a hall admin can see WHAT happened and WHEN, but not
+// which specific site-admin user acted. Actions with no JWT at all (public/PIN
+// routes like session finish) show as "Public (PIN entry)".
+app.get('/hall/event-audit-log', requireAuth, requireHallAuth, async (req, res) => {
+  const { event_type } = req.query;
+  const params = [req.hallId];
+  let filter = '';
+  if (event_type) {
+    params.push(event_type);
+    filter = ` AND eal.event_type = $${params.length}`;
+  }
+  try {
+    const result = await pool.query(
+      `SELECT eal.id, eal.event_type, eal.event_id, eal.action, eal.performed_by_role,
+              eal.snapshot, eal.detail, eal.created_at,
+              CASE
+                WHEN eal.performed_by_user_id IS NULL THEN 'Public (PIN entry)'
+                WHEN eal.performed_by_role = 'site_admin' THEN 'Site Admin'
+                ELSE u.user_name
+              END AS performed_by_label
+       FROM event_audit_log eal
+       LEFT JOIN users u ON u.user_id = eal.performed_by_user_id
+       WHERE eal.poolhall_id = $1 ${filter}
+       ORDER BY eal.created_at DESC
+       LIMIT 300`,
+      params
+    );
+    res.json({ logs: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3051,6 +3181,13 @@ app.put('/public/tryleague-sessions/:id/finish', async (req, res) => {
         [finished_at, id]
       );
       await upsertTryLeagueStats(client, id, session.poolhall_id);
+      // No req.user here — this is a public, PIN-authenticated route, not a JWT one.
+      // logEventAudit records performed_by_user_id/role as NULL, which the log viewer
+      // renders as "Public (PIN entry)".
+      await logEventAudit(client, {
+        poolhallId: session.poolhall_id, eventType: 'try_league', eventId: id,
+        action: 'finished', req: null, snapshot: result.rows[0]
+      });
       await client.query('COMMIT');
       res.json({ session: result.rows[0] });
     } catch (err) {
