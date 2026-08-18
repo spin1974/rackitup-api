@@ -3306,6 +3306,174 @@ async function upsertTryLeagueStats(client, sessionId, poolhallId) {
   console.log(`Session ${sessionId} finished: stats upserted for ${statsMap.size} players, ${allRoster.rows.length} total roster`);
 }
 
+// ── computeTryLeagueMatchDeltas ───────────────────────────────────────────────
+// Pure function — same rotate-double algorithm as upsertTryLeagueStats() above,
+// extracted so it can be reused for a LIVE multi-session aggregate (tag-filtered
+// standings, below) without touching the persisted-stats write path. Takes the
+// 'done' matches for a SINGLE session (rotate-double detection is session-scoped,
+// matching upsertTryLeagueStats's existing behavior) and returns a
+// Map<player_id, {wins, losses, points}> — no DB access, no side effects.
+function computeTryLeagueMatchDeltas(matchRows) {
+  const normalMatchPlayerIds = new Set();
+  for (const m of matchRows) {
+    if (!m.is_rotate) {
+      normalMatchPlayerIds.add(m.p1_id);
+      normalMatchPlayerIds.add(m.p2_id);
+    }
+  }
+  const statsMap = new Map();
+  const ensure = (id) => { if (!statsMap.has(id)) statsMap.set(id, { wins: 0, losses: 0, points: 0 }); };
+
+  for (const m of matchRows) {
+    const winnerId  = m.winner_id;
+    const loserId   = m.winner_id === m.p1_id ? m.p2_id : m.p1_id;
+    const winScore  = m.winner_id === m.p1_id ? m.score1 : m.score2;
+    const loseScore = m.winner_id === m.p1_id ? m.score2 : m.score1;
+
+    if (m.is_rotate) {
+      const doubleId    = normalMatchPlayerIds.has(m.p1_id) ? m.p1_id : m.p2_id;
+      const nonDoubleId = m.p1_id === doubleId ? m.p2_id : m.p1_id;
+      const nonDoubleWon   = m.winner_id === nonDoubleId;
+      const nonDoubleScore = nonDoubleId === m.p1_id ? m.score1 : m.score2;
+      ensure(nonDoubleId);
+      if (nonDoubleWon) statsMap.get(nonDoubleId).wins   += 1;
+      else              statsMap.get(nonDoubleId).losses += 1;
+      statsMap.get(nonDoubleId).points += nonDoubleScore;
+    } else {
+      ensure(winnerId);
+      ensure(loserId);
+      statsMap.get(winnerId).wins   += 1;
+      statsMap.get(winnerId).points += winScore;
+      statsMap.get(loserId).losses  += 1;
+      statsMap.get(loserId).points  += loseScore;
+    }
+  }
+  return statsMap;
+}
+
+// ── GET /hall/tryleague-tag-standings ─────────────────────────────────────────
+// Try League tag system Phase 5 (see context_tags_tl.md) — live-query cross-session
+// standings for every event carrying a given tag, optionally bounded by date range.
+// Deliberately NOT a persisted/cached table — tag membership and score corrections
+// should be reflected immediately, same principle as the rest of the tag design.
+// Ships Phase 5's recommended v1 scope: raw cumulative totals only, no "best N of M"
+// or drop-lowest — those are deferred to a config column on event_tags if a hall
+// actually asks for them. Divergent per-event config (e.g. different group sizes
+// under one tag) is not flagged in this version — also deferred per the doc.
+// Query params: tag_id (required), from / to (optional, YYYY-MM-DD, inclusive,
+// filtered against COALESCE(started_at, created_at)::date).
+app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (req, res) => {
+  const tagId = parseInt(req.query.tag_id, 10);
+  const { from, to } = req.query;
+  if (!tagId) return res.status(400).json({ error: 'tag_id is required' });
+
+  try {
+    const tagResult = await pool.query(
+      `SELECT id, name, is_active FROM event_tags WHERE id = $1 AND poolhall_id = $2`,
+      [tagId, req.hallId]
+    );
+    if (tagResult.rows.length === 0) return res.status(404).json({ error: 'Tag not found' });
+    const tag = tagResult.rows[0];
+
+    const dateConditions = [];
+    const params = [tagId, req.hallId];
+    if (from) { params.push(from); dateConditions.push(`COALESCE(s.started_at, s.created_at)::date >= $${params.length}::date`); }
+    if (to)   { params.push(to);   dateConditions.push(`COALESCE(s.started_at, s.created_at)::date <= $${params.length}::date`); }
+    const dateClause = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
+
+    const sessionsResult = await pool.query(
+      `SELECT s.session_id, s.name, s.status, s.started_at, s.created_at
+       FROM tryleague_sessions s
+       JOIN try_league_event_tags tlet ON tlet.event_id = s.session_id
+       WHERE tlet.tag_id = $1 AND s.poolhall_id = $2 ${dateClause}
+       ORDER BY COALESCE(s.started_at, s.created_at) ASC`,
+      params
+    );
+    const sessions = sessionsResult.rows;
+    if (sessions.length === 0) {
+      return res.json({ tag, sessions: [], players: [] });
+    }
+    const sessionIds = sessions.map(s => s.session_id);
+
+    const matchesResult = await pool.query(
+      `SELECT session_id, p1_id, p2_id, winner_id, is_rotate, score1, score2
+       FROM tryleague_matches
+       WHERE session_id = ANY($1::int[]) AND status = 'done' AND winner_id IS NOT NULL AND score1 IS NOT NULL`,
+      [sessionIds]
+    );
+    const rosterResult = await pool.query(
+      `SELECT session_id, player_id FROM tryleague_session_players WHERE session_id = ANY($1::int[])`,
+      [sessionIds]
+    );
+
+    // Group matches by session — rotate-double detection is session-scoped,
+    // same as upsertTryLeagueStats, so each session's deltas are computed
+    // independently before being summed across sessions.
+    const matchesBySession = new Map();
+    for (const m of matchesResult.rows) {
+      if (!matchesBySession.has(m.session_id)) matchesBySession.set(m.session_id, []);
+      matchesBySession.get(m.session_id).push(m);
+    }
+
+    const agg = new Map(); // player_id → { wins, losses, points, sessions_played }
+    const ensureAgg = (id) => { if (!agg.has(id)) agg.set(id, { wins: 0, losses: 0, points: 0, sessions_played: 0 }); };
+
+    for (const sessionId of sessionIds) {
+      const sessionMatches = matchesBySession.get(sessionId) || [];
+      const deltas = computeTryLeagueMatchDeltas(sessionMatches);
+      for (const [playerId, d] of deltas.entries()) {
+        ensureAgg(playerId);
+        const a = agg.get(playerId);
+        a.wins   += d.wins;
+        a.losses += d.losses;
+        a.points += d.points;
+      }
+    }
+    // sessions_played counts every roster appearance under this tag, including
+    // players with zero scored matches — same convention as upsertTryLeagueStats.
+    for (const r of rosterResult.rows) {
+      ensureAgg(r.player_id);
+      agg.get(r.player_id).sessions_played += 1;
+    }
+
+    if (agg.size === 0) {
+      return res.json({ tag, sessions: sessions.map(s => ({ session_id: s.session_id, name: s.name, status: s.status })), players: [] });
+    }
+
+    const playerIds = [...agg.keys()];
+    const playersResult = await pool.query(
+      `SELECT player_id, first_name, last_name, hall_rating, tier
+       FROM player WHERE player_id = ANY($1::int[])`,
+      [playerIds]
+    );
+    const playerInfo = new Map(playersResult.rows.map(p => [p.player_id, p]));
+
+    const players = playerIds.map(playerId => {
+      const info  = playerInfo.get(playerId) || {};
+      const stats = agg.get(playerId);
+      return {
+        player_id: playerId,
+        first_name: info.first_name || '',
+        last_name: info.last_name || '',
+        hall_rating: info.hall_rating || null,
+        tier: info.tier || null,
+        sessions_played: stats.sessions_played,
+        total_wins: stats.wins,
+        total_losses: stats.losses,
+        total_points: stats.points
+      };
+    });
+
+    res.json({
+      tag,
+      sessions: sessions.map(s => ({ session_id: s.session_id, name: s.name, status: s.status })),
+      players
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── PUT /public/tryleague-sessions/:id/finish ─────────────────────────────────
 // No JWT required. PIN in request body acts as auth.
 // Validates all non-rotate matches are done, then marks session finished and upserts stats.
