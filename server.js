@@ -3353,40 +3353,55 @@ function computeTryLeagueMatchDeltas(matchRows) {
 
 // ── GET /hall/tryleague-tag-standings ─────────────────────────────────────────
 // Try League tag system Phase 5 (see context_tags_tl.md) — live-query cross-session
-// standings for every event carrying a given tag, optionally bounded by date range.
-// Deliberately NOT a persisted/cached table — tag membership and score corrections
-// should be reflected immediately, same principle as the rest of the tag design.
-// Ships Phase 5's recommended v1 scope: raw cumulative totals only, no "best N of M"
-// or drop-lowest — those are deferred to a config column on event_tags if a hall
-// actually asks for them. Divergent per-event config (e.g. different group sizes
-// under one tag) is not flagged in this version — also deferred per the doc.
-// Query params: tag_id (required), from / to (optional, YYYY-MM-DD, inclusive,
+// standings, optionally filtered by tag and/or bounded by date range. tag_id is
+// OPTIONAL (2026-08-17 revision) — omitted means "every session at this hall in
+// range," matching reports/tl-players.html's lifetime-stats shape but computed
+// live instead of from the cached tryleague_player_stats table, so tag membership
+// and score corrections are reflected immediately.
+// Deliberately NOT a persisted/cached table. Ships Phase 5's recommended v1 scope:
+// raw cumulative totals only, no "best N of M" or drop-lowest — those are deferred
+// to a config column on event_tags if a hall actually asks for them. Divergent
+// per-event config (e.g. different group sizes under one tag) is not flagged in
+// this version — also deferred per the doc.
+// A player's stats are always ONE row, never split per tag — tags are informational
+// (see each player's `tags` array below), not a partition key. If tag_id IS given,
+// every session in scope carries that tag, so `tags` will just echo it back per
+// player; if tag_id is omitted, `tags` shows every tag that player has encountered
+// across the sessions in range (which may be several, or none).
+// Query params: tag_id (optional), from / to (optional, YYYY-MM-DD, inclusive,
 // filtered against COALESCE(started_at, created_at)::date).
 app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (req, res) => {
-  const tagId = parseInt(req.query.tag_id, 10);
+  const tagId = req.query.tag_id ? parseInt(req.query.tag_id, 10) : null;
   const { from, to } = req.query;
-  if (!tagId) return res.status(400).json({ error: 'tag_id is required' });
 
   try {
-    const tagResult = await pool.query(
-      `SELECT id, name, is_active FROM event_tags WHERE id = $1 AND poolhall_id = $2`,
-      [tagId, req.hallId]
-    );
-    if (tagResult.rows.length === 0) return res.status(404).json({ error: 'Tag not found' });
-    const tag = tagResult.rows[0];
+    let tag = null;
+    if (tagId) {
+      const tagResult = await pool.query(
+        `SELECT id, name, is_active FROM event_tags WHERE id = $1 AND poolhall_id = $2`,
+        [tagId, req.hallId]
+      );
+      if (tagResult.rows.length === 0) return res.status(404).json({ error: 'Tag not found' });
+      tag = tagResult.rows[0];
+    }
 
     const dateConditions = [];
-    const params = [tagId, req.hallId];
+    const params = tagId ? [tagId, req.hallId] : [req.hallId];
     if (from) { params.push(from); dateConditions.push(`COALESCE(s.started_at, s.created_at)::date >= $${params.length}::date`); }
     if (to)   { params.push(to);   dateConditions.push(`COALESCE(s.started_at, s.created_at)::date <= $${params.length}::date`); }
     const dateClause = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
 
     const sessionsResult = await pool.query(
-      `SELECT s.session_id, s.name, s.status, s.started_at, s.created_at
-       FROM tryleague_sessions s
-       JOIN try_league_event_tags tlet ON tlet.event_id = s.session_id
-       WHERE tlet.tag_id = $1 AND s.poolhall_id = $2 ${dateClause}
-       ORDER BY COALESCE(s.started_at, s.created_at) ASC`,
+      tagId
+        ? `SELECT s.session_id, s.name, s.status, s.started_at, s.created_at
+           FROM tryleague_sessions s
+           JOIN try_league_event_tags tlet ON tlet.event_id = s.session_id
+           WHERE tlet.tag_id = $1 AND s.poolhall_id = $2 ${dateClause}
+           ORDER BY COALESCE(s.started_at, s.created_at) ASC`
+        : `SELECT s.session_id, s.name, s.status, s.started_at, s.created_at
+           FROM tryleague_sessions s
+           WHERE s.poolhall_id = $1 ${dateClause}
+           ORDER BY COALESCE(s.started_at, s.created_at) ASC`,
       params
     );
     const sessions = sessionsResult.rows;
@@ -3405,6 +3420,21 @@ app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (re
       `SELECT session_id, player_id FROM tryleague_session_players WHERE session_id = ANY($1::int[])`,
       [sessionIds]
     );
+    // Tags actually attached to each in-scope session — powers the per-player
+    // `tags` badge list below. Independent of whether this request was itself
+    // tag_id-filtered (a session can carry more than one tag).
+    const sessionTagsResult = await pool.query(
+      `SELECT tlet.event_id AS session_id, et.id, et.name
+       FROM try_league_event_tags tlet
+       JOIN event_tags et ON et.id = tlet.tag_id
+       WHERE tlet.event_id = ANY($1::int[])`,
+      [sessionIds]
+    );
+    const tagsBySession = new Map();
+    for (const t of sessionTagsResult.rows) {
+      if (!tagsBySession.has(t.session_id)) tagsBySession.set(t.session_id, []);
+      tagsBySession.get(t.session_id).push({ id: t.id, name: t.name });
+    }
 
     // Group matches by session — rotate-double detection is session-scoped,
     // same as upsertTryLeagueStats, so each session's deltas are computed
@@ -3415,8 +3445,10 @@ app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (re
       matchesBySession.get(m.session_id).push(m);
     }
 
-    const agg = new Map(); // player_id → { wins, losses, points, sessions_played }
-    const ensureAgg = (id) => { if (!agg.has(id)) agg.set(id, { wins: 0, losses: 0, points: 0, sessions_played: 0 }); };
+    const agg = new Map(); // player_id → { wins, losses, points, sessions_played, tagIds: Set, tags: [] }
+    const ensureAgg = (id) => {
+      if (!agg.has(id)) agg.set(id, { wins: 0, losses: 0, points: 0, sessions_played: 0, tagIds: new Set(), tags: [] });
+    };
 
     for (const sessionId of sessionIds) {
       const sessionMatches = matchesBySession.get(sessionId) || [];
@@ -3429,11 +3461,17 @@ app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (re
         a.points += d.points;
       }
     }
-    // sessions_played counts every roster appearance under this tag, including
-    // players with zero scored matches — same convention as upsertTryLeagueStats.
+    // sessions_played counts every roster appearance in scope, including players
+    // with zero scored matches — same convention as upsertTryLeagueStats. Also
+    // where each player's `tags` badge list is built, from whichever sessions
+    // in scope they actually appear on the roster for.
     for (const r of rosterResult.rows) {
       ensureAgg(r.player_id);
-      agg.get(r.player_id).sessions_played += 1;
+      const a = agg.get(r.player_id);
+      a.sessions_played += 1;
+      for (const t of (tagsBySession.get(r.session_id) || [])) {
+        if (!a.tagIds.has(t.id)) { a.tagIds.add(t.id); a.tags.push(t); }
+      }
     }
 
     if (agg.size === 0) {
@@ -3460,7 +3498,8 @@ app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (re
         sessions_played: stats.sessions_played,
         total_wins: stats.wins,
         total_losses: stats.losses,
-        total_points: stats.points
+        total_points: stats.points,
+        tags: stats.tags.sort((a, b) => a.name.localeCompare(b.name))
       };
     });
 
