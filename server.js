@@ -1969,6 +1969,471 @@ app.get('/hall/roundrobin-tournaments/:id/matches', requireAuth, requireHallAuth
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ROUND ROBIN PHASE 4a — SCORE ENTRY + STANDINGS
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Read context_round_robin.md "Score entry model" before changing anything here.
+// The rules below are load-bearing, not stylistic:
+//
+//   * Every game row's two scores sum to 17. Legal values are 0-7 and 10-17.
+//   * 8 and 9 are EXCLUDED because 8+9=17 is the only pair with no winner.
+//     Removing that exclusion reintroduces a tie case the whole model has no
+//     answer for. Do not "helpfully" re-allow them.
+//   * >= 10 wins. NOT > 10. A strict > silently records no winner on every 10-7
+//     game, which takes months to notice in the wild.
+//   * Because the sum is fixed, ONE entry determines the whole game. The second
+//     entry is therefore double-entry VERIFICATION, not extra data — so a game
+//     counts in standings from the first entry, and the second either confirms
+//     it or raises a conflict. Never silently overwrite on disagreement.
+
+const RR_VALID_SCORES = new Set([0,1,2,3,4,5,6,7,10,11,12,13,14,15,16,17]);
+
+// Returns { ok:true, value } or { ok:false, error }
+function rrValidateScore(raw, label) {
+  if (raw === null || raw === undefined || raw === '') return { ok: true, value: null };
+  const n = Number(raw);
+  if (!Number.isInteger(n)) return { ok: false, error: `${label} must be a whole number` };
+  if (n < 0 || n > 17) return { ok: false, error: `${label} must be between 0 and 17` };
+  if (!RR_VALID_SCORES.has(n)) {
+    return { ok: false, error: `${label} cannot be ${n} — 8 and 9 are excluded because 8+9=17 has no winner. Scores must sum to 17, so both sides need a decidable result.` };
+  }
+  return { ok: true, value: n };
+}
+
+// Resolves the pair of scores for a normal (non-bye, non-makeup) game row from
+// whatever the caller supplied. Either side alone determines the other.
+// Returns { ok:true, score1, score2 } or { ok:false, error }.
+function rrResolvePair(s1, s2) {
+  if (s1 === null && s2 === null) return { ok: false, error: 'A score is required for at least one player' };
+  if (s1 !== null && s2 !== null) {
+    if (s1 + s2 !== 17) {
+      return { ok: false, error: `Scores must sum to 17 — ${s1} + ${s2} = ${s1 + s2}` };
+    }
+    return { ok: true, score1: s1, score2: s2 };
+  }
+  if (s1 !== null) return { ok: true, score1: s1, score2: 17 - s1 };
+  return { ok: true, score1: 17 - s2, score2: s2 };
+}
+
+// Handicap lookup — mirrors getHandicap() in tournaments/roundrobin.html.
+//
+// NOTE (2026-09-06): roundrobin_matches.handicap_bonus is documented as being
+// "calculated at schedule generation time and stored on each match row". It is NOT.
+// The string 'handicap_bonus' appears nowhere in this file — the schedule route never
+// writes it, so the column is 0 on every row that has ever been created. Standings
+// therefore compute the bonus live from config.handicap_grid, which also means an
+// admin correcting the grid mid-tournament actually takes effect. The column is left
+// in place but is vestigial; do not start trusting it without backfilling it first.
+//
+// Rating source is seed_rating (the snapshot taken at registration), NOT the player's
+// current hall_rating. The printed score sheets currently use hall_rating — if a
+// rating is edited mid-tournament the printed handicap and the standings handicap
+// will disagree. Flagged for the 4a frontend pass; seed_rating is the correct side of
+// that fix because placement must not shift under a player after the fact.
+function rrHandicapFor(grid, ratingA, ratingB) {
+  if (!Array.isArray(grid) || grid.length === 0) return 0;
+  const a = Number(ratingA), b = Number(ratingB);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  const diff = Math.abs(a - b);
+  for (const tier of grid) {
+    if (diff >= Number(tier.min) && diff <= Number(tier.max)) return Number(tier.bonus) || 0;
+  }
+  return 0;
+}
+
+// ── PUT /hall/roundrobin-tournaments/:id/matches/:matchId ─────────────────────
+// Enter or confirm a single game row.
+//
+// Body: { score1?, score2?, winner_id?, force? }
+//   - Supply either side, or both. One side derives the other.
+//   - winner_id is an explicit admin override; must be p1_id or p2_id.
+//   - force: true overwrites an existing score (admin correction). Without it, a
+//     disagreeing second entry returns 409 rather than clobbering the first.
+//
+// Status transitions:
+//   pending   + any entry            -> 'entered'   (counts in standings immediately)
+//   pending   + both sides by admin  -> 'confirmed' (admin entry is first class)
+//   entered   + agreeing entry       -> 'confirmed'
+//   entered   + disagreeing entry    -> 409, row untouched, 'score_conflict' logged
+//   confirmed + any entry            -> 409 unless force:true
+app.put('/hall/roundrobin-tournaments/:id/matches/:matchId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, matchId } = req.params;
+  const { winner_id, force } = req.body;
+
+  const v1 = rrValidateScore(req.body.score1, 'Player 1 score');
+  if (!v1.ok) return res.status(400).json({ error: v1.error });
+  const v2 = rrValidateScore(req.body.score2, 'Player 2 score');
+  if (!v2.ok) return res.status(400).json({ error: v2.error });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Lock the row for the duration — two people can and will enter the same game
+    // at the same time on a busy night, and the conflict check below is a
+    // read-then-write.
+    const mRes = await client.query(
+      `SELECT m.*, t.name AS tournament_name, t.config
+         FROM roundrobin_matches m
+         JOIN roundrobin_tournaments t ON t.tournament_id = m.tournament_id
+        WHERE m.match_id = $1 AND m.tournament_id = $2 AND t.poolhall_id = $3
+        FOR UPDATE OF m`,
+      [matchId, id, req.hallId]
+    );
+    if (mRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Match not found' });
+    }
+    const match = mRes.rows[0];
+
+    if (match.is_bye) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Bye rows are not scored — the bye player is credited a win automatically in standings.' });
+    }
+
+    let newScore1, newScore2, derivedWinner;
+
+    if (match.is_makeup) {
+      // Make-up round: p1 is the bye player and scores normally; p2 is a
+      // non-scoring body who plays but records nothing. The sum-to-17 rule does
+      // not apply here because there is no second score to sum against.
+      //
+      // OPEN — CONFIRM WITH CHRIS BEFORE A REAL ODD-PLAYER TOURNAMENT RUNS.
+      // The make-up path (built 2026-06-13) has never been exercised; the
+      // 2026-09-06 verification used 10 players so hasBye was false throughout.
+      // Two assumptions are baked in here: (1) only score1 is recorded, (2) p1 is
+      // credited the win when score1 >= 10 and nobody is credited otherwise.
+      if (v2.value !== null) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Make-up rounds record only the bye player\'s score — the second player is a non-scoring body.' });
+      }
+      if (v1.value === null) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'A score is required for the bye player' });
+      }
+      newScore1 = v1.value;
+      newScore2 = null;
+      derivedWinner = newScore1 >= 10 ? match.p1_id : null;
+    } else {
+      const pair = rrResolvePair(v1.value, v2.value);
+      if (!pair.ok) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: pair.error });
+      }
+      newScore1 = pair.score1;
+      newScore2 = pair.score2;
+      // >= 10 wins. 10 beats 7. Never change this to a strict >.
+      derivedWinner = newScore1 >= 10 ? match.p1_id : match.p2_id;
+    }
+
+    // Explicit admin override of the derived winner.
+    let finalWinner = derivedWinner;
+    if (winner_id !== undefined && winner_id !== null && winner_id !== '') {
+      const w = Number(winner_id);
+      if (w !== match.p1_id && w !== match.p2_id) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'winner_id must be one of the two players in this match' });
+      }
+      finalWinner = w;
+    }
+
+    const alreadyScored = match.status !== 'pending';
+    const agrees = alreadyScored &&
+                   Number(match.score1) === newScore1 &&
+                   (newScore2 === null ? match.score2 === null : Number(match.score2) === newScore2);
+
+    // ── Conflict path ────────────────────────────────────────────────────────
+    // A distinct, identifiable response — NOT a generic 400. The frontend has to
+    // be able to branch on this, which is why err.status/err.body preservation in
+    // apiFetch matters (see context_core.md, 2026-08-25).
+    if (alreadyScored && !agrees && !force) {
+      await logEventAudit(client, {
+        poolhallId: req.hallId, eventType: 'round_robin', eventId: Number(id),
+        action: 'score_conflict', req, snapshot: match,
+        detail: {
+          match_id: match.match_id,
+          group_idx: match.group_idx,
+          round_num: match.round_num,
+          match_num: match.match_num,
+          existing: { score1: match.score1, score2: match.score2, winner_id: match.winner_id, entered_via: match.entered_via },
+          submitted: { score1: newScore1, score2: newScore2, winner_id: finalWinner, entered_via: 'admin' }
+        }
+      });
+      await client.query('COMMIT');
+      return res.status(409).json({
+        error: 'This game already has a different score recorded. Nothing was changed.',
+        code: 'score_conflict',
+        existing: {
+          score1: match.score1, score2: match.score2,
+          winner_id: match.winner_id, status: match.status,
+          entered_via: match.entered_via, entered_at: match.entered_at
+        },
+        submitted: { score1: newScore1, score2: newScore2, winner_id: finalWinner }
+      });
+    }
+
+    // ── Resolve the new state ────────────────────────────────────────────────
+    // Admin supplying both sides of a normal game is a complete, verified entry in
+    // itself — admin entry is a first-class path, not a fallback, so it lands on
+    // 'confirmed' without waiting for a second scan that is never coming.
+    let newStatus;
+    if (!alreadyScored) {
+      const bothSuppliedByAdmin = !match.is_makeup && v1.value !== null && v2.value !== null;
+      newStatus = bothSuppliedByAdmin ? 'confirmed' : 'entered';
+    } else {
+      newStatus = 'confirmed';
+    }
+
+    const wasCorrection = alreadyScored && !agrees && force;
+
+    const upd = await client.query(
+      `UPDATE roundrobin_matches
+          SET score1       = $1,
+              score2       = $2,
+              winner_id    = $3,
+              status       = $4,
+              entered_via  = CASE WHEN $6 THEN 'admin' ELSE COALESCE(entered_via, 'admin') END,
+              entered_at   = COALESCE(entered_at, NOW()),
+              confirmed_at = CASE WHEN $4 = 'confirmed' THEN NOW() ELSE confirmed_at END,
+              updated_at   = NOW()
+        WHERE match_id = $5
+        RETURNING *`,
+      [newScore1, newScore2, finalWinner, newStatus, matchId, !!wasCorrection]
+    );
+
+    if (wasCorrection) {
+      await logEventAudit(client, {
+        poolhallId: req.hallId, eventType: 'round_robin', eventId: Number(id),
+        action: 'score_corrected', req, snapshot: upd.rows[0],
+        detail: {
+          match_id: match.match_id,
+          group_idx: match.group_idx,
+          round_num: match.round_num,
+          match_num: match.match_num,
+          old: { score1: match.score1, score2: match.score2, winner_id: match.winner_id, status: match.status },
+          new: { score1: newScore1, score2: newScore2, winner_id: finalWinner, status: newStatus }
+        }
+      });
+    }
+
+    await client.query('COMMIT');
+    res.json({ match: upd.rows[0] });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ── GET /hall/roundrobin-tournaments/:id/standings ────────────────────────────
+// Live-query only. Nothing is persisted and nothing is recomputed on a schedule —
+// standings are always derived from the current match rows, so a corrected score is
+// reflected on the next load with no recompute path to fall out of sync.
+//
+// Placement (locked 2026-07-18):
+//   1. (wins + handicap_bonus) desc  <- handicap folds INTO placement, it is not
+//                                       merely displayed next to it
+//   2. ball_points desc              <- tiebreak only
+//   3. still tied -> shared placement. No programmatic head-to-head decider: with
+//      matches_per_opponent = 4 a pairing can itself split 2-2, so head-to-head is
+//      not a reliable answer. A hall wanting a clean result arranges a decider match.
+app.get('/hall/roundrobin-tournaments/:id/standings', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const tRes = await pool.query(
+      `SELECT tournament_id, name, status, config
+         FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (tRes.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    const tournament = tRes.rows[0];
+    const config = tournament.config || {};
+    const grid = config.handicap_grid || [];
+
+    // handicap_mode is documented as being chosen by the admin at tournament
+    // creation, but the Create Tournament modal does not currently send it — it
+    // sends entry_fee and handicap_grid only. Defaulting to 'per_win' preserves the
+    // documented default rather than silently zeroing every bonus. See the open
+    // question on per_win magnitude in context_round_robin.md before treating the
+    // resulting numbers as final.
+    const handicapMode = config.handicap_mode === 'per_round' ? 'per_round' : 'per_win';
+
+    const pRes = await pool.query(
+      `SELECT rtp.player_id, rtp.group_idx, rtp.seed_rating, rtp.paid,
+              p.first_name, p.last_name, p.hall_rating
+         FROM roundrobin_tournament_players rtp
+         JOIN player p ON p.player_id = rtp.player_id
+        WHERE rtp.tournament_id = $1
+        ORDER BY rtp.group_idx NULLS LAST, p.last_name, p.first_name`,
+      [id]
+    );
+
+    const mRes = await pool.query(
+      `SELECT match_id, group_idx, round_num, match_num, p1_id, p2_id,
+              score1, score2, winner_id, is_bye, is_makeup, status
+         FROM roundrobin_matches
+        WHERE tournament_id = $1
+        ORDER BY group_idx, round_num, match_id`,
+      [id]
+    );
+
+    const seedOf = new Map();
+    const rows = new Map();
+    for (const p of pRes.rows) {
+      seedOf.set(p.player_id, p.seed_rating != null ? Number(p.seed_rating) : null);
+      rows.set(p.player_id, {
+        player_id: p.player_id,
+        first_name: p.first_name,
+        last_name: p.last_name,
+        group_idx: p.group_idx,
+        seed_rating: p.seed_rating != null ? Number(p.seed_rating) : null,
+        hall_rating: p.hall_rating != null ? Number(p.hall_rating) : null,
+        wins: 0,
+        losses: 0,
+        byes: 0,
+        ball_points: 0,
+        handicap_bonus: 0,
+        games_scored: 0,
+        games_pending: 0
+      });
+    }
+
+    // per_round mode pays a flat bonus once per round to the lower-rated player in
+    // that round's pairing, regardless of how many of that round's games they win.
+    // Tracked as player_id::round_num so repeated game rows in the same round can't
+    // pay it more than once.
+    const roundBonusPaid = new Set();
+
+    const groupProgress = new Map();
+    const bump = (gi, key) => {
+      if (!groupProgress.has(gi)) groupProgress.set(gi, { total: 0, pending: 0, entered: 0, confirmed: 0 });
+      groupProgress.get(gi)[key]++;
+    };
+
+    for (const m of mRes.rows) {
+      bump(m.group_idx, 'total');
+
+      if (m.is_bye) {
+        // A bye row never carries a score and stays 'pending' forever, so it must be
+        // credited outside the status check below or bye wins vanish from standings.
+        const r = rows.get(m.p1_id);
+        if (r) { r.wins += 1; r.byes += 1; }
+        bump(m.group_idx, 'confirmed');
+        continue;
+      }
+
+      if (m.status === 'pending') {
+        bump(m.group_idx, 'pending');
+        const r1 = rows.get(m.p1_id); if (r1) r1.games_pending++;
+        const r2 = m.p2_id ? rows.get(m.p2_id) : null; if (r2 && !m.is_makeup) r2.games_pending++;
+        continue;
+      }
+
+      bump(m.group_idx, m.status === 'confirmed' ? 'confirmed' : 'entered');
+
+      const r1 = rows.get(m.p1_id);
+      const r2 = m.p2_id ? rows.get(m.p2_id) : null;
+
+      if (r1) {
+        r1.games_scored++;
+        r1.ball_points += Number(m.score1) || 0;
+      }
+      // On a make-up row p2 is a non-scoring body: no ball points, no win, no loss.
+      if (r2 && !m.is_makeup) {
+        r2.games_scored++;
+        r2.ball_points += Number(m.score2) || 0;
+      }
+
+      if (m.winner_id && rows.has(m.winner_id)) rows.get(m.winner_id).wins += 1;
+      if (m.winner_id && !m.is_makeup) {
+        const loserId = m.winner_id === m.p1_id ? m.p2_id : m.p1_id;
+        if (loserId && rows.has(loserId)) rows.get(loserId).losses += 1;
+      }
+
+      // Handicap: paid to the LOWER-rated player of the pairing, matching the
+      // printed score sheet's "+X hcap to you" line which only appears on the
+      // lower-rated player's sheet.
+      if (!m.is_makeup && m.p2_id) {
+        const s1 = seedOf.get(m.p1_id), s2 = seedOf.get(m.p2_id);
+        if (s1 != null && s2 != null && s1 !== s2) {
+          const lowerId = s1 < s2 ? m.p1_id : m.p2_id;
+          const bonus = rrHandicapFor(grid, s1, s2);
+          if (bonus) {
+            if (handicapMode === 'per_round') {
+              const key = `${lowerId}:${m.round_num}`;
+              if (!roundBonusPaid.has(key)) {
+                roundBonusPaid.add(key);
+                const r = rows.get(lowerId);
+                if (r) r.handicap_bonus += bonus;
+              }
+            } else if (m.winner_id === lowerId) {
+              const r = rows.get(lowerId);
+              if (r) r.handicap_bonus += bonus;
+            }
+          }
+        }
+      }
+    }
+
+    // ── Group, sort, place ───────────────────────────────────────────────────
+    const byGroup = new Map();
+    for (const r of rows.values()) {
+      r.handicap_bonus = Math.round(r.handicap_bonus * 100) / 100;
+      r.total_points   = Math.round((r.wins + r.handicap_bonus) * 100) / 100;
+      const gi = r.group_idx ?? 0;
+      if (!byGroup.has(gi)) byGroup.set(gi, []);
+      byGroup.get(gi).push(r);
+    }
+
+    const groups = [...byGroup.keys()].sort((a, b) => a - b).map(gi => {
+      const players = byGroup.get(gi).sort((a, b) =>
+        (b.total_points - a.total_points) || (b.ball_points - a.ball_points)
+      );
+      // Standard competition ranking: a two-way tie for 1st gives 1, 1, 3.
+      let place = 0;
+      players.forEach((p, i) => {
+        const prev = players[i - 1];
+        const tied = prev &&
+          prev.total_points === p.total_points &&
+          prev.ball_points  === p.ball_points;
+        if (!tied) place = i + 1;
+        p.placement = place;
+        p.shared_placement = false;
+      });
+      for (const p of players) {
+        if (players.filter(q => q.placement === p.placement).length > 1) p.shared_placement = true;
+      }
+      const prog = groupProgress.get(gi) || { total: 0, pending: 0, entered: 0, confirmed: 0 };
+      return {
+        group_idx: gi,
+        players,
+        progress: {
+          total: prog.total,
+          scored: prog.total - prog.pending,
+          pending: prog.pending,
+          entered: prog.entered,
+          confirmed: prog.confirmed
+        }
+      };
+    });
+
+    res.json({
+      tournament: {
+        tournament_id: tournament.tournament_id,
+        name: tournament.name,
+        status: tournament.status
+      },
+      handicap_mode: handicapMode,
+      handicap_grid: grid,
+      groups
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // LEAGUE ENDPOINTS (Phase 1 — league CRUD + teams + roster)
 // ═══════════════════════════════════════════════════════════════════════════════
 
