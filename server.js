@@ -2176,13 +2176,15 @@ app.put('/hall/roundrobin-tournaments/:id/matches/:matchId', requireAuth, requir
     // Admin supplying both sides of a normal game is a complete, verified entry in
     // itself — admin entry is a first-class path, not a fallback, so it lands on
     // 'confirmed' without waiting for a second scan that is never coming.
-    let newStatus;
-    if (!alreadyScored) {
-      const bothSuppliedByAdmin = !match.is_makeup && v1.value !== null && v2.value !== null;
-      newStatus = bothSuppliedByAdmin ? 'confirmed' : 'entered';
-    } else {
-      newStatus = 'confirmed';
-    }
+    // Anything entered through THIS route is entered by a hall_admin off the paper
+    // sheet, and the admin is the authority — so it lands on 'confirmed' regardless
+    // of whether one side or both were supplied. Because the scores sum to 17, one
+    // side fully determines the game; there is no second half still outstanding.
+    //
+    // The 'entered' state is NOT dead: Phase 4b's public per-player QR route writes
+    // it, because a player self-scanning genuinely does want a second pair of eyes
+    // before it counts as verified. Do not collapse the state out of the model.
+    const newStatus = 'confirmed';
 
     const wasCorrection = alreadyScored && !agrees && force;
 
@@ -2267,8 +2269,12 @@ app.get('/hall/roundrobin-tournaments/:id/standings', requireAuth, requireHallAu
     // resulting numbers as final.
     const handicapMode = config.handicap_mode === 'per_round' ? 'per_round' : 'per_win';
 
+    // NOTE: rtp.paid is documented in context_round_robin.md's schema but is
+    // selected by no other route in this file, and selecting it here returned a 500.
+    // Not selected because it is not used; verify via information_schema whether the
+    // column exists at all before anything starts relying on it.
     const pRes = await pool.query(
-      `SELECT rtp.player_id, rtp.group_idx, rtp.seed_rating, rtp.paid,
+      `SELECT rtp.player_id, rtp.group_idx, rtp.seed_rating,
               p.first_name, p.last_name, p.hall_rating
          FROM roundrobin_tournament_players rtp
          JOIN player p ON p.player_id = rtp.player_id
