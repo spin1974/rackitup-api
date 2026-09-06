@@ -1292,7 +1292,12 @@ app.post('/hall/roundrobin-tournaments', requireAuth, requireHallAdmin, async (r
        RETURNING tournament_id, poolhall_id, name, status, config, created_at, updated_at`,
       [req.hallId, name.trim(), config ? JSON.stringify(config) : JSON.stringify({})]
     );
-    res.status(201).json({ tournament: result.rows[0] });
+    const tournament = result.rows[0];
+    await logEventAudit(pool, {
+      poolhallId: req.hallId, eventType: 'round_robin', eventId: tournament.tournament_id,
+      action: 'created', req, snapshot: tournament
+    });
+    res.status(201).json({ tournament });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1334,18 +1339,52 @@ app.put('/hall/roundrobin-tournaments/:id', requireAuth, requireHallAdmin, async
     return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
   }
   try {
-    const result = await pool.query(
-      `UPDATE roundrobin_tournaments
-       SET name       = COALESCE($1, name),
-           status     = COALESCE($2, status),
-           config     = COALESCE($3, config),
-           updated_at = NOW()
-       WHERE tournament_id = $4 AND poolhall_id = $5
-       RETURNING tournament_id, poolhall_id, name, status, config, created_at, updated_at`,
-      [name || null, status || null, config ? JSON.stringify(config) : null, id, req.hallId]
+    // Read the current row first — the audit log needs the OLD status, which a
+    // blind COALESCE UPDATE throws away. Mirrors the Try League PUT.
+    const current = await pool.query(
+      `SELECT tournament_id, status FROM roundrobin_tournaments
+       WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
-    res.json({ tournament: result.rows[0] });
+    if (current.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    const oldStatus = current.rows[0].status;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        `UPDATE roundrobin_tournaments
+         SET name       = COALESCE($1, name),
+             status     = COALESCE($2, status),
+             config     = COALESCE($3, config),
+             updated_at = NOW()
+         WHERE tournament_id = $4 AND poolhall_id = $5
+         RETURNING tournament_id, poolhall_id, name, status, config, created_at, updated_at`,
+        [name || null, status || null, config ? JSON.stringify(config) : null, id, req.hallId]
+      );
+
+      // A transition INTO 'finished' logs as its own 'finished' action rather than a
+      // generic 'status_change', so completion reads the same across modules (Try
+      // League emits 'finished' from its public finish route). old_status is kept in
+      // detail so nothing is lost by not using status_change here. When Phase 5 adds
+      // a dedicated PUT .../status route, move this call there.
+      if (status && status !== oldStatus) {
+        const isFinish = status === 'finished';
+        await logEventAudit(client, {
+          poolhallId: req.hallId, eventType: 'round_robin', eventId: id,
+          action: isFinish ? 'finished' : 'status_change', req, snapshot: result.rows[0],
+          detail: { old_status: oldStatus, new_status: status }
+        });
+      }
+
+      await client.query('COMMIT');
+      res.json({ tournament: result.rows[0] });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1355,12 +1394,51 @@ app.put('/hall/roundrobin-tournaments/:id', requireAuth, requireHallAdmin, async
 app.delete('/hall/roundrobin-tournaments/:id', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   try {
+    // Snapshot the tournament before it goes — the DELETE's RETURNING clause gives
+    // back only id + name, and the audit log wants status/config/created_at too.
+    const existing = await pool.query(
+      `SELECT tournament_id, poolhall_id, name, status, config, created_at, updated_at
+       FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    const tournament = existing.rows[0];
+
+    // Capture counts + roster BEFORE the delete cascades them away — this is the only
+    // chance to record what was actually lost. Same pattern as the Try League delete.
+    const counts = await pool.query(
+      `SELECT
+         (SELECT COUNT(*) FROM roundrobin_tournament_players WHERE tournament_id = $1) AS player_count,
+         (SELECT COUNT(*) FROM roundrobin_matches WHERE tournament_id = $1) AS match_count,
+         (SELECT COUNT(*) FROM roundrobin_matches WHERE tournament_id = $1 AND status != 'pending') AS matches_done`,
+      [id]
+    );
+    const roster = await pool.query(
+      `SELECT p.first_name, p.last_name
+       FROM roundrobin_tournament_players rtp JOIN player p ON p.player_id = rtp.player_id
+       WHERE rtp.tournament_id = $1
+       ORDER BY rtp.seed_rating DESC NULLS LAST, p.last_name`,
+      [id]
+    );
+
     const result = await pool.query(
       `DELETE FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2
        RETURNING tournament_id, name`,
       [id, req.hallId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+
+    await logEventAudit(pool, {
+      poolhallId: req.hallId, eventType: 'round_robin', eventId: id, action: 'deleted', req,
+      snapshot: tournament,
+      detail: {
+        player_count: parseInt(counts.rows[0].player_count, 10),
+        match_count:  parseInt(counts.rows[0].match_count, 10),
+        matches_done: parseInt(counts.rows[0].matches_done, 10),
+        roster: roster.rows.map(r => `${r.first_name} ${r.last_name}`)
+      }
+    });
+
     res.json({ message: 'Tournament deleted', tournament: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1444,12 +1522,15 @@ app.post('/hall/roundrobin-tournaments/:id/schedule', requireAuth, requireHallAd
 
   try {
     const tResult = await pool.query(
-      `SELECT tournament_id, poolhall_id, status, config
+      `SELECT tournament_id, poolhall_id, name, status, config
        FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
       [id, req.hallId]
     );
     if (tResult.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
     if (tResult.rows[0].status === 'finished') return res.status(409).json({ error: 'Tournament is already finished' });
+
+    const priorStatus = tResult.rows[0].status;
+    let priorMatches = 0, priorScored = 0;
 
     const cfg = tResult.rows[0].config || {};
     const defaultRounds = Number(cfg.rounds)              || 5;
@@ -1726,6 +1807,20 @@ app.post('/hall/roundrobin-tournaments/:id/schedule', requireAuth, requireHallAd
         );
       }
 
+      // Count what this regenerate is about to destroy, BEFORE deleting. Schedule
+      // generation is the one routinely-used destructive action in this module — it
+      // wipes every match row, and once Phase 4 lands that includes entered scores.
+      // priorScored is the number that matters: a non-zero value means real results
+      // were thrown away.
+      const prior = await client.query(
+        `SELECT COUNT(*) AS match_count,
+                COUNT(*) FILTER (WHERE status != 'pending') AS scored_count
+         FROM roundrobin_matches WHERE tournament_id = $1`,
+        [id]
+      );
+      priorMatches = parseInt(prior.rows[0].match_count, 10);
+      priorScored  = parseInt(prior.rows[0].scored_count, 10);
+
       // Delete any previously generated matches
       await client.query(`DELETE FROM roundrobin_matches WHERE tournament_id = $1`, [id]);
 
@@ -1740,10 +1835,25 @@ app.post('/hall/roundrobin-tournaments/:id/schedule', requireAuth, requireHallAd
       }
 
       // Transition to running
-      await client.query(
-        `UPDATE roundrobin_tournaments SET status = 'running', updated_at = NOW() WHERE tournament_id = $1`,
+      const updated = await client.query(
+        `UPDATE roundrobin_tournaments SET status = 'running', updated_at = NOW()
+         WHERE tournament_id = $1
+         RETURNING tournament_id, poolhall_id, name, status, config, created_at, updated_at`,
         [id]
       );
+
+      await logEventAudit(client, {
+        poolhallId: req.hallId, eventType: 'round_robin', eventId: id,
+        action: 'schedule_generated', req, snapshot: updated.rows[0],
+        detail: {
+          groups: N,
+          match_count: matchRows.length,
+          replaced_existing: priorMatches > 0,
+          prior_match_count: priorMatches,
+          prior_scored_count: priorScored,
+          old_status: priorStatus
+        }
+      });
 
       await client.query('COMMIT');
     } catch (err) {
