@@ -2194,11 +2194,19 @@ app.put('/hall/roundrobin-tournaments/:id/matches/:matchId', requireAuth, requir
               status       = $4,
               entered_via  = CASE WHEN $6 THEN 'admin' ELSE COALESCE(entered_via, 'admin') END,
               entered_at   = COALESCE(entered_at, NOW()),
-              confirmed_at = CASE WHEN $4 = 'confirmed' THEN NOW() ELSE confirmed_at END,
+              -- $7 rather than reusing $4: Postgres infers a parameter's type from
+              -- its first use, so status = $4 fixes $4 as varchar and a later
+              -- comparison against a text literal is rejected with "inconsistent
+              -- types deduced for parameter $4". A separate boolean beats a cast:
+              -- one parameter should carry one meaning.
+              -- COALESCE keeps the FIRST confirmation time rather than moving it on
+              -- every later save, matching entered_at's semantics.
+              confirmed_at = CASE WHEN $7 THEN COALESCE(confirmed_at, NOW()) ELSE confirmed_at END,
               updated_at   = NOW()
         WHERE match_id = $5
         RETURNING *`,
-      [newScore1, newScore2, finalWinner, newStatus, matchId, !!wasCorrection]
+      [newScore1, newScore2, finalWinner, newStatus, matchId, !!wasCorrection,
+       newStatus === 'confirmed']
     );
 
     if (wasCorrection) {
