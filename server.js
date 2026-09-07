@@ -2337,6 +2337,19 @@ app.get('/hall/roundrobin-tournaments/:id/standings', requireAuth, requireHallAu
     // pay it more than once.
     const roundBonusPaid = new Set();
 
+    // BUG FIX (2026-09-07): the schedule generator emits `matches_per_opponent`
+    // rows per bye occurrence (one per match_num), mirroring how a real pairing
+    // gets that many game rows — see the schedule route's own comment, "Emit
+    // match rows: one per match_num (e.g. 3 rows for matchesPerRound=3)", which
+    // applies to bye rows too. But a bye is ONE event, not `mpo` of them, and the
+    // scoring rule is "Bye: 1 win point" — once. Crediting every row multiplied a
+    // single bye by mpo (confirmed live: three rows, one round, wins=3/byes=3 for
+    // a player with exactly one bye). Same dedup pattern as roundBonusPaid above,
+    // keyed the same way — first bye row seen for a player+round pays it, the
+    // rest of that round's duplicate rows still count toward group progress
+    // (they are real rows) but no longer toward wins/byes a second or third time.
+    const byeRoundCredited = new Set();
+
     const groupProgress = new Map();
     const bump = (gi, key) => {
       if (!groupProgress.has(gi)) groupProgress.set(gi, { total: 0, pending: 0, entered: 0, confirmed: 0 });
@@ -2349,9 +2362,13 @@ app.get('/hall/roundrobin-tournaments/:id/standings', requireAuth, requireHallAu
       if (m.is_bye) {
         // A bye row never carries a score and stays 'pending' forever, so it must be
         // credited outside the status check below or bye wins vanish from standings.
-        const r = rows.get(m.p1_id);
-        if (r) { r.wins += 1; r.byes += 1; }
         bump(m.group_idx, 'confirmed');
+        const beKey = `${m.p1_id}:${m.round_num}`;
+        if (!byeRoundCredited.has(beKey)) {
+          byeRoundCredited.add(beKey);
+          const r = rows.get(m.p1_id);
+          if (r) { r.wins += 1; r.byes += 1; }
+        }
         continue;
       }
 
