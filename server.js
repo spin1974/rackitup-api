@@ -4,6 +4,7 @@ const cors    = require('cors');
 const { Pool } = require('pg');
 const bcrypt  = require('bcrypt');
 const jwt     = require('jsonwebtoken');
+const crypto  = require('crypto');
 
 const app        = express();
 const PORT       = process.env.PORT || 3000;
@@ -28,6 +29,15 @@ const RATE_LIMIT_WINDOW = 15 * 60 * 1000;
 // "Could not submit" errors for legitimate captains.
 const RATE_LIMIT_TL_MAX    = 60;
 const RATE_LIMIT_TL_WINDOW = 15 * 60 * 1000;
+
+// Public Round Robin self-entry routes (Phase 4b) get their OWN bucket - not
+// shared with login, and deliberately not shared with checkTlRateLimit either.
+// Same shared-IP-via-NAT reasoning as Try League, but a bigger ceiling: Round
+// Robin is individual competition, so every player at the hall is a client
+// rather than one captain per group, and each player submits once per game
+// row (up to matches_per_opponent x opponents each).
+const RATE_LIMIT_RR_MAX    = 200;
+const RATE_LIMIT_RR_WINDOW = 15 * 60 * 1000;
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
 const allowedOrigins = (process.env.ALLOWED_ORIGIN || '')
@@ -99,6 +109,9 @@ const checkRateLimit = makeRateLimiter(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW);
 // Public Try League score-entry routes — separate, higher-ceiling bucket (see
 // RATE_LIMIT_TL_MAX comment above for why).
 const checkTlRateLimit = makeRateLimiter(RATE_LIMIT_TL_MAX, RATE_LIMIT_TL_WINDOW);
+
+// Public Round Robin per-player self-entry routes - own bucket, see above.
+const checkRrRateLimit = makeRateLimiter(RATE_LIMIT_RR_MAX, RATE_LIMIT_RR_WINDOW);
 
 // ── Middleware: require valid JWT ─────────────────────────────────────────────
 function requireAuth(req, res, next) {
@@ -1355,6 +1368,7 @@ app.get('/hall/roundrobin-tournaments/:id', requireAuth, requireHallAuth, async 
 
     const pResult = await pool.query(
       `SELECT rtp.tournament_player_id, rtp.player_id, rtp.group_idx, rtp.seed_rating, rtp.created_at,
+              rtp.entry_token,
               p.first_name, p.last_name, p.hall_rating, p.fargo_rating, p.tier
        FROM roundrobin_tournament_players rtp
        JOIN player p ON p.player_id = rtp.player_id
@@ -1504,12 +1518,16 @@ app.post('/hall/roundrobin-tournaments/:id/players', requireAuth, requireHallAdm
     if (pCheck.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
 
     const seedRating = pCheck.rows[0].hall_rating || null;
+    // Phase 4b: every roster row carries a random entry token. The printed score
+    // sheet's entry QR encodes THIS, never the player_id - a sequential id in a
+    // public URL would let anyone edit anyone's scores by counting upward.
+    const entryToken = crypto.randomBytes(16).toString('hex');
     const result = await pool.query(
-      `INSERT INTO roundrobin_tournament_players (tournament_id, player_id, seed_rating, created_at)
-       VALUES ($1, $2, $3, NOW())
+      `INSERT INTO roundrobin_tournament_players (tournament_id, player_id, seed_rating, entry_token, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
        ON CONFLICT (tournament_id, player_id) DO NOTHING
-       RETURNING tournament_player_id, tournament_id, player_id, group_idx, seed_rating, created_at`,
-      [id, player_id, seedRating]
+       RETURNING tournament_player_id, tournament_id, player_id, group_idx, seed_rating, entry_token, created_at`,
+      [id, player_id, seedRating, entryToken]
     );
     if (!result.rows.length) return res.status(409).json({ error: 'Player already registered' });
     res.status(201).json({ player: result.rows[0] });
@@ -3676,6 +3694,400 @@ app.put('/hall/tryleague-sessions/:id/matches/:matchId', requireAuth, requireHal
     res.json({ match: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ==============================================================================
+// Round Robin Phase 4b - public per-player self score entry
+// ==============================================================================
+// No JWT. Gated by a random 32-char entry_token on roundrobin_tournament_players,
+// which is what the per-player QR on the printed score sheet encodes.
+//
+// Read context_round_robin.md "Score entry model" before touching these. The
+// scoring rules are identical to the hall-admin route and reuse the same
+// validators - do NOT fork the math. What differs is the STATE MODEL:
+//
+//   admin route:  any entry -> 'confirmed'. The admin is the authority.
+//   these routes: first entry -> 'entered' (counts in standings immediately),
+//                 a SECOND entry BY A DIFFERENT PLAYER that agrees -> 'confirmed'.
+//
+// That second entry is double-entry verification, not extra data - the scores
+// sum to 17, so one side already determines the whole game. It is the only
+// error-catching control on a paper sheet that had no validation at all, and it
+// only works if the two entries come from two different people. That is what
+// roundrobin_matches.entered_by_player_id is for.
+//
+// HONEST LIMIT, accepted by Chris: entered_by_player_id records whose SHEET was
+// scanned, not who held the phone. Kevin handing his sheet to John and asking
+// him to enter it records Kevin. This is expected, normal use. Never describe
+// this field as "who entered it" in UI copy.
+
+// Short display names for an unauthenticated page: first name alone when it is
+// unique across the roster, first name + last-name initial(s) when it is not.
+// Full last names never appear on a public page (PII rule, context_core.md).
+function rrShortNames(players) {
+  const firstCount = new Map();
+  for (const p of players) {
+    const f = (p.first_name || '').trim();
+    firstCount.set(f, (firstCount.get(f) || 0) + 1);
+  }
+  const out = new Map();
+  for (const p of players) {
+    const f = (p.first_name || '').trim();
+    if ((firstCount.get(f) || 0) > 1) {
+      const initials = (p.last_name || '').trim().split(/\s+/)
+        .filter(Boolean).map(w => w[0].toUpperCase() + '.').join('');
+      out.set(p.player_id, initials ? f + ' ' + initials : f);
+    } else {
+      out.set(p.player_id, f);
+    }
+  }
+  return out;
+}
+
+// Resolves a token to its roster row + tournament, and enforces the two gates
+// every public route here shares. Returns { error, status } or { ok:true, ... }.
+async function rrResolveEntryToken(dbClient, token) {
+  if (!token || typeof token !== 'string' || !/^[a-f0-9]{32}$/i.test(token)) {
+    return { status: 404, error: 'Invalid entry link' };
+  }
+  const r = await dbClient.query(
+    `SELECT rtp.tournament_player_id, rtp.player_id, rtp.group_idx,
+            t.tournament_id, t.poolhall_id, t.name AS tournament_name,
+            t.status AS tournament_status, t.config,
+            ph.poolhall_name
+       FROM roundrobin_tournament_players rtp
+       JOIN roundrobin_tournaments t ON t.tournament_id = rtp.tournament_id
+       JOIN poolhall ph ON ph.poolhall_id = t.poolhall_id
+      WHERE rtp.entry_token = $1`,
+    [token]
+  );
+  // Same 404 for a malformed token and an unknown one - a distinct "no such
+  // token" response would confirm which tokens exist.
+  if (r.rows.length === 0) return { status: 404, error: 'Invalid entry link' };
+  const row = r.rows[0];
+  const config = row.config || {};
+
+  // self_entry defaults OFF. Absent means off, so every tournament created
+  // before 4b stays admin-entry-only with no action needed.
+  if (config.self_entry !== true) {
+    return { status: 403, error: 'Self score entry is not enabled for this tournament. Hand your sheet to the tournament admin.' };
+  }
+  if (row.tournament_status !== 'running') {
+    return { status: 403, error: row.tournament_status === 'finished'
+      ? 'This tournament has finished - scores are closed.'
+      : 'This tournament has not started yet.' };
+  }
+  return { ok: true, row, config };
+}
+
+// ── GET /public/roundrobin-entry/:token ───────────────────────────────────────
+// That player's own matches, and nothing else. No roster, no other player's
+// sheet, no ratings.
+app.get('/public/roundrobin-entry/:token', async (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  if (!checkRrRateLimit(ip)) return res.status(429).json({ error: 'Too many requests' });
+
+  try {
+    const resolved = await rrResolveEntryToken(pool, req.params.token);
+    if (!resolved.ok) return res.status(resolved.status).json({ error: resolved.error });
+    const { row } = resolved;
+
+    const rosterRes = await pool.query(
+      `SELECT rtp.player_id, p.first_name, p.last_name
+         FROM roundrobin_tournament_players rtp
+         JOIN player p ON p.player_id = rtp.player_id
+        WHERE rtp.tournament_id = $1`,
+      [row.tournament_id]
+    );
+    const names = rrShortNames(rosterRes.rows);
+
+    const mRes = await pool.query(
+      `SELECT match_id, group_idx, round_num, match_num, p1_id, p2_id,
+              score1, score2, winner_id, is_bye, is_makeup, status,
+              entered_via, entered_by_player_id
+         FROM roundrobin_matches
+        WHERE tournament_id = $1 AND (p1_id = $2 OR p2_id = $2)
+        ORDER BY round_num, match_num, match_id`,
+      [row.tournament_id, row.player_id]
+    );
+
+    const me = row.player_id;
+    const matches = mRes.rows.map(m => {
+      const isP1     = m.p1_id === me;
+      const oppId    = isP1 ? m.p2_id : m.p1_id;
+      const myScore  = isP1 ? m.score1 : m.score2;
+      const oppScore = isP1 ? m.score2 : m.score1;
+
+      // A make-up row's p2 is a non-scoring body: they play, they record
+      // nothing. Only p1 (the bye player) has a score to enter.
+      const makeupBody = m.is_makeup && !isP1;
+
+      // Who may still write to this row from a public page:
+      //   pending          -> anyone in the match
+      //   entered by me    -> me, amending my own unconfirmed entry
+      //   entered by them  -> me, as the verifying second entry
+      //   confirmed        -> nobody. Admin resolves from here.
+      const can_enter = !m.is_bye && !makeupBody && m.status !== 'confirmed';
+
+      return {
+        match_id: m.match_id,
+        group_idx: m.group_idx,
+        round_num: m.round_num,
+        match_num: m.match_num,
+        is_bye: m.is_bye,
+        is_makeup: m.is_makeup,
+        makeup_body: makeupBody,
+        opponent_id: oppId,
+        opponent_name: oppId ? (names.get(oppId) || 'Opponent') : null,
+        my_side: isP1 ? 'p1' : 'p2',
+        my_score: myScore,
+        opponent_score: oppScore,
+        status: m.status,
+        entered_via: m.entered_via,
+        entered_by_me: m.entered_by_player_id != null && m.entered_by_player_id === me,
+        awaiting_my_check: m.status === 'entered' &&
+                           m.entered_by_player_id != null &&
+                           m.entered_by_player_id !== me,
+        can_enter
+      };
+    });
+
+    res.json({
+      tournament: {
+        tournament_id: row.tournament_id,
+        name: row.tournament_name,
+        status: row.tournament_status
+      },
+      poolhall_name: row.poolhall_name,
+      player: {
+        player_id: row.player_id,
+        display_name: names.get(row.player_id) || 'You',
+        group_idx: row.group_idx
+      },
+      matches
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /public/roundrobin-entry/:token/matches/:matchId ──────────────────────
+// Body: { score } - the TOKEN PLAYER'S OWN score for that game row.
+//
+// Deliberately not { score1, score2 }: the caller submits their own side and the
+// server maps it to p1/p2 from the token. A public caller never gets to name
+// which database column they are writing, and the sum-to-17 rule derives the
+// opponent's half anyway.
+//
+// There is no force flag here. A public caller can never overwrite a confirmed
+// score - that is an admin action on the desktop page, where it is logged as
+// score_corrected.
+app.put('/public/roundrobin-entry/:token/matches/:matchId', async (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  if (!checkRrRateLimit(ip)) return res.status(429).json({ error: 'Too many requests' });
+
+  const { matchId } = req.params;
+
+  // Same validator as the hall-admin route. 0-7 and 10-17 only; 8 and 9 are
+  // excluded because 8+9=17 is the only pair with no winner. Server-side,
+  // always - the mobile page blocks them too, but client-side validation is
+  // never the only layer (defense in depth, context_core.md).
+  const v = rrValidateScore(req.body.score, 'Score');
+  if (!v.ok) return res.status(400).json({ error: v.error });
+  if (v.value === null) return res.status(400).json({ error: 'A score is required' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const resolved = await rrResolveEntryToken(client, req.params.token);
+    if (!resolved.ok) {
+      await client.query('ROLLBACK');
+      return res.status(resolved.status).json({ error: resolved.error });
+    }
+    const { row } = resolved;
+    const me = row.player_id;
+
+    // Lock the row. Two players entering the same game at the same time is not
+    // hypothetical here - that is precisely the flow this feature encourages.
+    const mRes = await client.query(
+      `SELECT * FROM roundrobin_matches
+        WHERE match_id = $1 AND tournament_id = $2
+        FOR UPDATE`,
+      [matchId, row.tournament_id]
+    );
+    if (mRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Game not found' });
+    }
+    const match = mRes.rows[0];
+
+    if (match.p1_id !== me && match.p2_id !== me) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'That game is not on your sheet' });
+    }
+    if (match.is_bye) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'A bye is not scored - the win is credited automatically.' });
+    }
+
+    const isP1 = match.p1_id === me;
+
+    if (match.is_makeup && !isP1) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'You play this game but do not record a score for it.' });
+    }
+
+    let newScore1, newScore2, derivedWinner;
+    if (match.is_makeup) {
+      // Make-up row: only the bye player (p1) scores, so there is no complement
+      // to derive and no second entry that could ever verify it. See the open
+      // question in context_round_robin.md - this path has still never run.
+      newScore1 = v.value;
+      newScore2 = null;
+      derivedWinner = newScore1 >= 10 ? match.p1_id : null;
+    } else {
+      const pair = rrResolvePair(isP1 ? v.value : null, isP1 ? null : v.value);
+      if (!pair.ok) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: pair.error });
+      }
+      newScore1 = pair.score1;
+      newScore2 = pair.score2;
+      // >= 10 wins. 10 beats 7. Never a strict >.
+      derivedWinner = newScore1 >= 10 ? match.p1_id : match.p2_id;
+    }
+
+    const alreadyScored = match.status !== 'pending';
+    const agrees = alreadyScored &&
+                   Number(match.score1) === newScore1 &&
+                   (newScore2 === null ? match.score2 === null : Number(match.score2) === newScore2);
+    const enteredByMe = match.entered_by_player_id != null &&
+                        match.entered_by_player_id === me;
+
+    // ── Already confirmed ────────────────────────────────────────────────────
+    if (match.status === 'confirmed') {
+      if (agrees) {
+        // Idempotent: someone re-submitting a value that already matches is a
+        // double-tap or a re-scan, not a conflict. Say so and change nothing.
+        await client.query('COMMIT');
+        return res.json({ match_id: match.match_id, status: 'confirmed',
+                          my_score: isP1 ? match.score1 : match.score2,
+                          opponent_score: isP1 ? match.score2 : match.score1,
+                          unchanged: true });
+      }
+      await logEventAudit(client, {
+        poolhallId: row.poolhall_id, eventType: 'round_robin', eventId: row.tournament_id,
+        action: 'score_conflict', req, snapshot: match,
+        detail: {
+          match_id: match.match_id, group_idx: match.group_idx,
+          round_num: match.round_num, match_num: match.match_num,
+          existing: { score1: match.score1, score2: match.score2,
+                      winner_id: match.winner_id, status: match.status,
+                      entered_via: match.entered_via,
+                      entered_by_player_id: match.entered_by_player_id },
+          submitted: { score1: newScore1, score2: newScore2,
+                       winner_id: derivedWinner, entered_via: 'self',
+                       entered_by_player_id: me }
+        }
+      });
+      await client.query('COMMIT');
+      return res.status(409).json({
+        error: 'This game is already confirmed with a different score. Nothing was changed - see the tournament admin.',
+        code: 'score_conflict',
+        existing: { my_score: isP1 ? match.score1 : match.score2,
+                    opponent_score: isP1 ? match.score2 : match.score1 },
+        submitted: { my_score: v.value }
+      });
+    }
+
+    // ── Entered by the OTHER player, and this entry disagrees ────────────────
+    // The whole point of the second entry. Flag it, change nothing, let the
+    // admin resolve it off the two paper sheets.
+    if (match.status === 'entered' && !enteredByMe && !agrees) {
+      await logEventAudit(client, {
+        poolhallId: row.poolhall_id, eventType: 'round_robin', eventId: row.tournament_id,
+        action: 'score_conflict', req, snapshot: match,
+        detail: {
+          match_id: match.match_id, group_idx: match.group_idx,
+          round_num: match.round_num, match_num: match.match_num,
+          existing: { score1: match.score1, score2: match.score2,
+                      winner_id: match.winner_id, status: match.status,
+                      entered_via: match.entered_via,
+                      entered_by_player_id: match.entered_by_player_id },
+          submitted: { score1: newScore1, score2: newScore2,
+                       winner_id: derivedWinner, entered_via: 'self',
+                       entered_by_player_id: me }
+        }
+      });
+      await client.query('COMMIT');
+      return res.status(409).json({
+        error: 'That does not match the score already entered for this game. Nothing was changed - check the sheet with your opponent, or hand it to the tournament admin.',
+        code: 'score_conflict',
+        existing: { my_score: isP1 ? match.score1 : match.score2,
+                    opponent_score: isP1 ? match.score2 : match.score1 },
+        submitted: { my_score: v.value }
+      });
+    }
+
+    // ── Resolve the new state ────────────────────────────────────────────────
+    //   pending                        -> 'entered', stamped with who entered it
+    //   entered by ME                  -> stays 'entered'. Amending my own
+    //                                     unconfirmed entry is not a conflict -
+    //                                     without this a mistyped score is a
+    //                                     dead end at the hall with no way back.
+    //   entered by THEM, and agrees    -> 'confirmed'. Two people, same number.
+    //
+    // A make-up row can never reach 'confirmed' this way: only p1 can submit,
+    // so there is no second party. It stays 'entered' until an admin confirms.
+    let newStatus = 'entered';
+    let newEnteredBy = match.entered_by_player_id;
+
+    if (match.status === 'pending') {
+      newEnteredBy = me;
+    } else if (!enteredByMe && agrees) {
+      newStatus = 'confirmed';
+    }
+
+    const upd = await client.query(
+      `UPDATE roundrobin_matches
+          SET score1               = $1,
+              score2               = $2,
+              winner_id            = $3,
+              status               = $4,
+              entered_via          = COALESCE(entered_via, 'self'),
+              entered_by_player_id = $5,
+              entered_at           = COALESCE(entered_at, NOW()),
+              -- $7 boolean rather than reusing $4: Postgres fixes a parameter's
+              -- type from its first use, so status = $4 makes $4 varchar and a
+              -- later comparison against a text literal is rejected outright
+              -- ("inconsistent types deduced for parameter"). One parameter,
+              -- one meaning. COALESCE keeps the FIRST confirmation time.
+              confirmed_at         = CASE WHEN $7 THEN COALESCE(confirmed_at, NOW()) ELSE confirmed_at END,
+              updated_at           = NOW()
+        WHERE match_id = $6
+        RETURNING match_id, score1, score2, winner_id, status, entered_via,
+                  entered_by_player_id, entered_at, confirmed_at`,
+      [newScore1, newScore2, derivedWinner, newStatus, newEnteredBy, matchId,
+       newStatus === 'confirmed']
+    );
+
+    await client.query('COMMIT');
+    const m = upd.rows[0];
+    res.json({
+      match_id: m.match_id,
+      status: m.status,
+      my_score: isP1 ? m.score1 : m.score2,
+      opponent_score: isP1 ? m.score2 : m.score1,
+      confirmed: m.status === 'confirmed',
+      awaiting_verification: m.status === 'entered'
+    });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
