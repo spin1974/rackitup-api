@@ -1339,9 +1339,9 @@ app.post('/hall/roundrobin-tournaments', requireAuth, requireHallAdmin, async (r
       return res.status(409).json({ error: 'A tournament is already active. Finish it before creating a new one.' });
     }
     const result = await pool.query(
-      `INSERT INTO roundrobin_tournaments (poolhall_id, name, status, config, created_at, updated_at)
-       VALUES ($1, $2, 'setup', $3, NOW(), NOW())
-       RETURNING tournament_id, poolhall_id, name, status, config, created_at, updated_at`,
+      `INSERT INTO roundrobin_tournaments (poolhall_id, name, status, config, public_id, created_at, updated_at)
+       VALUES ($1, $2, 'setup', $3, LEFT(MD5(RANDOM()::TEXT), 12), NOW(), NOW())
+       RETURNING tournament_id, poolhall_id, name, status, config, public_id, created_at, updated_at`,
       [req.hallId, name.trim(), config ? JSON.stringify(config) : JSON.stringify({})]
     );
     const tournament = result.rows[0];
@@ -1360,7 +1360,7 @@ app.get('/hall/roundrobin-tournaments/:id', requireAuth, requireHallAuth, async 
   const { id } = req.params;
   try {
     const tResult = await pool.query(
-      `SELECT tournament_id, poolhall_id, name, status, config, created_at, updated_at
+      `SELECT tournament_id, poolhall_id, name, status, config, public_id, created_at, updated_at
        FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
       [id, req.hallId]
     );
@@ -1412,7 +1412,7 @@ app.put('/hall/roundrobin-tournaments/:id', requireAuth, requireHallAdmin, async
              config     = COALESCE($3, config),
              updated_at = NOW()
          WHERE tournament_id = $4 AND poolhall_id = $5
-         RETURNING tournament_id, poolhall_id, name, status, config, created_at, updated_at`,
+         RETURNING tournament_id, poolhall_id, name, status, config, public_id, created_at, updated_at`,
         [name || null, status || null, config ? JSON.stringify(config) : null, id, req.hallId]
       );
 
@@ -2514,26 +2514,29 @@ app.get('/hall/roundrobin-tournaments/:id/standings', requireAuth, requireHallAu
   }
 });
 
-// ── GET /public/roundrobin-tournaments/:id ─────────────────────────────────────
+// ── GET /public/roundrobin-tournaments/:publicId ────────────────────────────────
 // Phase 4c. No auth — public report page (reports/roundrobin.html): roster,
-// matches, and standings for read-only display. Only exposes 'running' or
-// 'finished' tournaments (mirrors /public/tryleague-sessions/:id) — a 'setup'
+// matches, and standings for read-only display. Looked up via public_id (opaque
+// 12-char token, same pattern as poolhall.public_id) rather than the sequential
+// tournament_id — mirrors why entry_token isn't a raw player_id: a raw integer
+// in a public URL is enumerable, an opaque token isn't. Only exposes 'running'
+// or 'finished' tournaments (mirrors /public/tryleague-sessions/:id) — a 'setup'
 // tournament has no schedule yet and shouldn't be linkable.
 //
 // entry_token is deliberately NOT selected here — it is the per-player self-entry
 // secret and this route has no token gate of its own. Standings math is shared
 // with the /hall/.../standings route via computeRoundRobinStandings() above; do
 // not recompute it here.
-app.get('/public/roundrobin-tournaments/:id', async (req, res) => {
-  const { id } = req.params;
+app.get('/public/roundrobin-tournaments/:publicId', async (req, res) => {
+  const { publicId } = req.params;
   try {
     const tRes = await pool.query(
       `SELECT rt.tournament_id, rt.name, rt.status, rt.config, rt.created_at,
               ph.poolhall_name
          FROM roundrobin_tournaments rt
          JOIN poolhall ph ON ph.poolhall_id = rt.poolhall_id
-        WHERE rt.tournament_id = $1 AND rt.status IN ('running', 'finished')`,
-      [id]
+        WHERE rt.public_id = $1 AND rt.status IN ('running', 'finished')`,
+      [publicId]
     );
     if (tRes.rows.length === 0) {
       return res.status(404).json({ error: 'Tournament not found or not yet started' });
@@ -2548,7 +2551,7 @@ app.get('/public/roundrobin-tournaments/:id', async (req, res) => {
          JOIN player p ON p.player_id = rtp.player_id
         WHERE rtp.tournament_id = $1
         ORDER BY rtp.group_idx NULLS LAST, p.last_name, p.first_name`,
-      [id]
+      [tournament.tournament_id]
     );
 
     const mRes = await pool.query(
@@ -2557,14 +2560,13 @@ app.get('/public/roundrobin-tournaments/:id', async (req, res) => {
          FROM roundrobin_matches
         WHERE tournament_id = $1
         ORDER BY group_idx, round_num, match_id`,
-      [id]
+      [tournament.tournament_id]
     );
 
     const { handicap_mode, handicap_grid, groups } = computeRoundRobinStandings(config, pRes.rows, mRes.rows);
 
     res.json({
       tournament: {
-        tournament_id: tournament.tournament_id,
         name: tournament.name,
         status: tournament.status,
         created_at: tournament.created_at
