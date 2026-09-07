@@ -2254,7 +2254,12 @@ app.put('/hall/roundrobin-tournaments/:id/matches/:matchId', requireAuth, requir
   }
 });
 
-// ── GET /hall/roundrobin-tournaments/:id/standings ────────────────────────────
+// ── computeRoundRobinStandings ──────────────────────────────────────────────
+// Pure function, no DB access. Shared by /hall/roundrobin-tournaments/:id/standings
+// (Phase 4a) and /public/roundrobin-tournaments/:id (Phase 4c) so the two routes
+// can never drift apart on the math. If the public report ever needs different
+// data, add it in the calling route — do not fork this function.
+//
 // Live-query only. Nothing is persisted and nothing is recomputed on a schedule —
 // standings are always derived from the current match rows, so a corrected score is
 // reflected on the next load with no recompute path to fall out of sync.
@@ -2266,53 +2271,25 @@ app.put('/hall/roundrobin-tournaments/:id/matches/:matchId', requireAuth, requir
 //   3. still tied -> shared placement. No programmatic head-to-head decider: with
 //      matches_per_opponent = 4 a pairing can itself split 2-2, so head-to-head is
 //      not a reliable answer. A hall wanting a clean result arranges a decider match.
-app.get('/hall/roundrobin-tournaments/:id/standings', requireAuth, requireHallAuth, async (req, res) => {
-  const { id } = req.params;
-  try {
-    const tRes = await pool.query(
-      `SELECT tournament_id, name, status, config
-         FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
-      [id, req.hallId]
-    );
-    if (tRes.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
-    const tournament = tRes.rows[0];
-    const config = tournament.config || {};
-    const grid = config.handicap_grid || [];
+//
+// config: the tournament's config JSONB (for handicap_mode + handicap_grid)
+// playerRows: rows shaped like { player_id, group_idx, seed_rating, first_name, last_name, hall_rating }
+// matchRows: rows shaped like { match_id, group_idx, round_num, match_num, p1_id, p2_id,
+//                                score1, score2, winner_id, is_bye, is_makeup, status }
+function computeRoundRobinStandings(config, playerRows, matchRows) {
+  const grid = config.handicap_grid || [];
 
-    // handicap_mode is documented as being chosen by the admin at tournament
-    // creation, but the Create Tournament modal does not currently send it — it
-    // sends entry_fee and handicap_grid only. Defaulting to 'per_win' preserves the
-    // documented default rather than silently zeroing every bonus. See the open
-    // question on per_win magnitude in context_round_robin.md before treating the
-    // resulting numbers as final.
-    const handicapMode = config.handicap_mode === 'per_round' ? 'per_round' : 'per_win';
+  // handicap_mode is documented as being chosen by the admin at tournament
+  // creation, but the Create Tournament modal does not currently send it — it
+  // sends entry_fee and handicap_grid only. Defaulting to 'per_win' preserves the
+  // documented default rather than silently zeroing every bonus. See the open
+  // question on per_win magnitude in context_round_robin.md before treating the
+  // resulting numbers as final.
+  const handicapMode = config.handicap_mode === 'per_round' ? 'per_round' : 'per_win';
 
-    // NOTE: rtp.paid is documented in context_round_robin.md's schema but is
-    // selected by no other route in this file, and selecting it here returned a 500.
-    // Not selected because it is not used; verify via information_schema whether the
-    // column exists at all before anything starts relying on it.
-    const pRes = await pool.query(
-      `SELECT rtp.player_id, rtp.group_idx, rtp.seed_rating,
-              p.first_name, p.last_name, p.hall_rating
-         FROM roundrobin_tournament_players rtp
-         JOIN player p ON p.player_id = rtp.player_id
-        WHERE rtp.tournament_id = $1
-        ORDER BY rtp.group_idx NULLS LAST, p.last_name, p.first_name`,
-      [id]
-    );
-
-    const mRes = await pool.query(
-      `SELECT match_id, group_idx, round_num, match_num, p1_id, p2_id,
-              score1, score2, winner_id, is_bye, is_makeup, status
-         FROM roundrobin_matches
-        WHERE tournament_id = $1
-        ORDER BY group_idx, round_num, match_id`,
-      [id]
-    );
-
-    const seedOf = new Map();
+  const seedOf = new Map();
     const rows = new Map();
-    for (const p of pRes.rows) {
+    for (const p of playerRows) {
       seedOf.set(p.player_id, p.seed_rating != null ? Number(p.seed_rating) : null);
       rows.set(p.player_id, {
         player_id: p.player_id,
@@ -2356,7 +2333,7 @@ app.get('/hall/roundrobin-tournaments/:id/standings', requireAuth, requireHallAu
       groupProgress.get(gi)[key]++;
     };
 
-    for (const m of mRes.rows) {
+    for (const m of matchRows) {
       bump(m.group_idx, 'total');
 
       if (m.is_bye) {
@@ -2467,14 +2444,136 @@ app.get('/hall/roundrobin-tournaments/:id/standings', requireAuth, requireHallAu
       };
     });
 
+  return { handicap_mode: handicapMode, handicap_grid: grid, groups };
+}
+
+// ── GET /hall/roundrobin-tournaments/:id/standings ────────────────────────────
+// Live-query only. Nothing is persisted and nothing is recomputed on a schedule —
+// standings are always derived from the current match rows, so a corrected score is
+// reflected on the next load with no recompute path to fall out of sync.
+//
+// Placement (locked 2026-07-18):
+//   1. (wins + handicap_bonus) desc  <- handicap folds INTO placement, it is not
+//                                       merely displayed next to it
+//   2. ball_points desc              <- tiebreak only
+//   3. still tied -> shared placement. No programmatic head-to-head decider: with
+//      matches_per_opponent = 4 a pairing can itself split 2-2, so head-to-head is
+//      not a reliable answer. A hall wanting a clean result arranges a decider match.
+//
+// Math lives in computeRoundRobinStandings() above, shared with the Phase 4c
+// public report route below — do not fork it back into this route.
+app.get('/hall/roundrobin-tournaments/:id/standings', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const tRes = await pool.query(
+      `SELECT tournament_id, name, status, config
+         FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (tRes.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    const tournament = tRes.rows[0];
+    const config = tournament.config || {};
+
+    // NOTE: rtp.paid is documented in context_round_robin.md's schema but is
+    // selected by no other route in this file, and selecting it here returned a 500.
+    // Not selected because it is not used; verify via information_schema whether the
+    // column exists at all before anything starts relying on it.
+    const pRes = await pool.query(
+      `SELECT rtp.player_id, rtp.group_idx, rtp.seed_rating,
+              p.first_name, p.last_name, p.hall_rating
+         FROM roundrobin_tournament_players rtp
+         JOIN player p ON p.player_id = rtp.player_id
+        WHERE rtp.tournament_id = $1
+        ORDER BY rtp.group_idx NULLS LAST, p.last_name, p.first_name`,
+      [id]
+    );
+
+    const mRes = await pool.query(
+      `SELECT match_id, group_idx, round_num, match_num, p1_id, p2_id,
+              score1, score2, winner_id, is_bye, is_makeup, status
+         FROM roundrobin_matches
+        WHERE tournament_id = $1
+        ORDER BY group_idx, round_num, match_id`,
+      [id]
+    );
+
+    const { handicap_mode, handicap_grid, groups } = computeRoundRobinStandings(config, pRes.rows, mRes.rows);
+
     res.json({
       tournament: {
         tournament_id: tournament.tournament_id,
         name: tournament.name,
         status: tournament.status
       },
-      handicap_mode: handicapMode,
-      handicap_grid: grid,
+      handicap_mode,
+      handicap_grid,
+      groups
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /public/roundrobin-tournaments/:id ─────────────────────────────────────
+// Phase 4c. No auth — public report page (reports/roundrobin.html): roster,
+// matches, and standings for read-only display. Only exposes 'running' or
+// 'finished' tournaments (mirrors /public/tryleague-sessions/:id) — a 'setup'
+// tournament has no schedule yet and shouldn't be linkable.
+//
+// entry_token is deliberately NOT selected here — it is the per-player self-entry
+// secret and this route has no token gate of its own. Standings math is shared
+// with the /hall/.../standings route via computeRoundRobinStandings() above; do
+// not recompute it here.
+app.get('/public/roundrobin-tournaments/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const tRes = await pool.query(
+      `SELECT rt.tournament_id, rt.name, rt.status, rt.config, rt.created_at,
+              ph.poolhall_name
+         FROM roundrobin_tournaments rt
+         JOIN poolhall ph ON ph.poolhall_id = rt.poolhall_id
+        WHERE rt.tournament_id = $1 AND rt.status IN ('running', 'finished')`,
+      [id]
+    );
+    if (tRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Tournament not found or not yet started' });
+    }
+    const tournament = tRes.rows[0];
+    const config = tournament.config || {};
+
+    const pRes = await pool.query(
+      `SELECT rtp.player_id, rtp.group_idx, rtp.seed_rating,
+              p.first_name, p.last_name, p.hall_rating
+         FROM roundrobin_tournament_players rtp
+         JOIN player p ON p.player_id = rtp.player_id
+        WHERE rtp.tournament_id = $1
+        ORDER BY rtp.group_idx NULLS LAST, p.last_name, p.first_name`,
+      [id]
+    );
+
+    const mRes = await pool.query(
+      `SELECT match_id, group_idx, round_num, match_num, p1_id, p2_id,
+              score1, score2, winner_id, is_bye, is_makeup, status
+         FROM roundrobin_matches
+        WHERE tournament_id = $1
+        ORDER BY group_idx, round_num, match_id`,
+      [id]
+    );
+
+    const { handicap_mode, handicap_grid, groups } = computeRoundRobinStandings(config, pRes.rows, mRes.rows);
+
+    res.json({
+      tournament: {
+        tournament_id: tournament.tournament_id,
+        name: tournament.name,
+        status: tournament.status,
+        created_at: tournament.created_at
+      },
+      poolhall_name: tournament.poolhall_name,
+      players: pRes.rows,
+      matches: mRes.rows,
+      handicap_mode,
+      handicap_grid,
       groups
     });
   } catch (err) {
