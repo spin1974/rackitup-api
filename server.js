@@ -923,10 +923,15 @@ app.get('/hall/players', requireAuth, requireHallAuth, async (req, res) => {
               p.created_at, p.updated_at,
               COALESCE(s.total_wins,     0) AS tl_wins,
               COALESCE(s.total_losses,   0) AS tl_losses,
-              COALESCE(s.sessions_played,0) AS tl_sessions
+              COALESCE(s.sessions_played,0) AS tl_sessions,
+              COALESCE(rr.wins,        0) AS rr_wins,
+              COALESCE(rr.losses,      0) AS rr_losses,
+              COALESCE(rr.tournaments, 0) AS rr_tournaments
        FROM player p
        LEFT JOIN tryleague_player_stats s
          ON s.player_id = p.player_id AND s.poolhall_id = p.poolhall_id
+       LEFT JOIN roundrobin_player_stats rr
+         ON rr.player_id = p.player_id AND rr.poolhall_id = p.poolhall_id
        WHERE p.poolhall_id = $1 AND p.deleted_at IS NULL
        ORDER BY p.last_name ASC, p.first_name ASC`,
       [req.hallId]
