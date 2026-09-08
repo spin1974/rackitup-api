@@ -2487,30 +2487,35 @@ function computeRoundRobinStandings(config, playerRows, matchRows) {
     // (they are real rows) but no longer toward wins/byes a second or third time.
     const byeRoundCredited = new Set();
 
-    // BUG FIX (2026-09-08): a bye that gets compensated by a make-up match
-    // (odd-player-count tournaments, is_makeup=true) was earning BOTH the
-    // automatic bye win AND a real win-or-loss result from the make-up match —
-    // double-crediting the one round they actually missed. The make-up round's
-    // entire purpose is to give a bye player a real game in place of what they
-    // sat out, so once a make-up match exists for a bye occurrence, the bye
-    // itself should stay informational (still shown in the Bye column) but
-    // must NOT also pay a free win — the make-up match's real score decides
-    // win/loss instead. A bye with no compensating make-up match (even-player
-    // tournaments, no odd-man-out) is unaffected and still earns its 1 win, per
-    // the locked Scoring rules table.
-    // Pre-pass: how many make-up rounds is each player compensated for. In this
-    // design there's normally one make-up round total, so this is 0 or 1 per
-    // player — deduped by round_num the same way byeRoundCredited dedupes game
-    // rows within a round, so mpo>1 doesn't inflate the count.
-    const makeupRoundsByPlayer = new Map(); // player_id -> Set(round_num)
+    // BUG FIX (2026-09-08, corrected): a bye that gets compensated by a
+    // make-up-round game was earning BOTH the automatic bye win AND a real
+    // win-or-loss result from that game — double-crediting the one round they
+    // actually missed. First attempt at this fix keyed off the `is_makeup`
+    // flag, but tournament 23's real data (confirmed via direct query) showed
+    // that's wrong: only the odd-man-out's row against a non-scoring filler is
+    // actually flagged is_makeup=true. A genuine bye-vs-bye pairing in the
+    // make-up round is stored as an ORDINARY two-sided match (is_makeup=false,
+    // both sides score) — it just happens to fall in the extra round. Keying
+    // off is_makeup alone caught only the odd-man-out and missed every bye
+    // player paired against another bye player.
+    // Corrected approach: find the make-up round's round_num (wherever an
+    // is_makeup row exists — there's normally exactly one), then treat ANYONE
+    // who actually scores in that round — either side, make-up-flagged row or
+    // not — as compensated. That naturally excludes the odd-man-out's
+    // non-scoring filler opponent (their score is null) without needing them
+    // to have a bye to begin with.
+    let makeupRoundNum = null;
     for (const m of matchRows) {
-      if (m.is_makeup && m.p1_id) {
-        if (!makeupRoundsByPlayer.has(m.p1_id)) makeupRoundsByPlayer.set(m.p1_id, new Set());
-        makeupRoundsByPlayer.get(m.p1_id).add(m.round_num);
+      if (m.is_makeup) { makeupRoundNum = m.round_num; break; }
+    }
+    const makeupCompensated = new Set();
+    if (makeupRoundNum != null) {
+      for (const m of matchRows) {
+        if (m.round_num !== makeupRoundNum || m.is_bye) continue;
+        if (m.score1 != null) makeupCompensated.add(m.p1_id);
+        if (m.score2 != null && m.p2_id) makeupCompensated.add(m.p2_id);
       }
     }
-    const makeupCompensationRemaining = new Map();
-    for (const [pid, set] of makeupRoundsByPlayer.entries()) makeupCompensationRemaining.set(pid, set.size);
 
     const groupProgress = new Map();
     const bump = (gi, key) => {
@@ -2531,14 +2536,11 @@ function computeRoundRobinStandings(config, playerRows, matchRows) {
           const r = rows.get(m.p1_id);
           if (r) {
             r.byes += 1;
-            const remaining = makeupCompensationRemaining.get(m.p1_id) || 0;
-            if (remaining > 0) {
-              // This bye is being made up by a real match elsewhere in the
-              // tournament — don't also pay the automatic bye win.
-              makeupCompensationRemaining.set(m.p1_id, remaining - 1);
-            } else {
+            if (!makeupCompensated.has(m.p1_id)) {
               r.wins += 1;
             }
+            // else: this bye was made up by a real game elsewhere in the
+            // tournament — don't also pay the automatic bye win.
           }
         }
         continue;
