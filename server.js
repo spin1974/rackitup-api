@@ -738,6 +738,52 @@ app.delete('/admin/db/tryleague-sessions/:id', requireAuth, requireSiteAdmin, as
   }
 });
 
+// ── GET /admin/db/roundrobin-orphans ──────────────────────────────────────────
+// Round Robin Phase 5 (2026-09-07+). Same shape as tryleague-orphans/chip
+// orphans above — setup/running tournaments older than min_age_days that were
+// likely abandoned rather than finished.
+app.get('/admin/db/roundrobin-orphans', requireAuth, requireSiteAdmin, async (req, res) => {
+  const minDays = parseInt(req.query.min_age_days, 10);
+  if (isNaN(minDays) || minDays < 0) return res.status(400).json({ error: 'min_age_days must be a non-negative integer' });
+  try {
+    const result = await pool.query(`
+      SELECT rt.tournament_id, rt.name, rt.status, rt.created_at,
+             ph.poolhall_id, ph.poolhall_name, ph.city, ph.province_state,
+             EXTRACT(EPOCH FROM (NOW() - rt.created_at)) / 86400 AS age_days,
+             (SELECT COUNT(*) FROM roundrobin_tournament_players rtp WHERE rtp.tournament_id = rt.tournament_id) AS player_count
+      FROM roundrobin_tournaments rt JOIN poolhall ph ON ph.poolhall_id = rt.poolhall_id
+      WHERE rt.status IN ('setup', 'running')
+        AND rt.created_at < NOW() - ($1 || ' days')::INTERVAL
+      ORDER BY rt.created_at ASC
+    `, [minDays]);
+    res.json({ orphans: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /admin/db/roundrobin-tournaments/:id ───────────────────────────────
+// Site-admin cleanup delete — unscoped, no audit-log entry (matches the chip and
+// Try League admin-delete routes above; distinct from the hall-scoped
+// DELETE /hall/roundrobin-tournaments/:id, which DOES write to event_audit_log).
+app.delete('/admin/db/roundrobin-tournaments/:id', requireAuth, requireSiteAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const check = await pool.query(
+      `SELECT rt.tournament_id, rt.name, rt.status, rt.created_at, ph.poolhall_name
+       FROM roundrobin_tournaments rt JOIN poolhall ph ON ph.poolhall_id = rt.poolhall_id
+       WHERE rt.tournament_id = $1`, [id]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    const t = check.rows[0];
+    await pool.query(`DELETE FROM roundrobin_tournaments WHERE tournament_id = $1`, [id]);
+    console.log(`[ADMIN DELETE] roundrobin tournament_id=${t.tournament_id} name="${t.name}" hall="${t.poolhall_name}" status=${t.status} deleted_by=user_id:${req.user.user_id}`);
+    res.json({ deleted: true, tournament_id: t.tournament_id, name: t.name });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── GET /admin/event-audit-log ────────────────────────────────────────────────
 // Site-admin, unscoped. Unlike the hall-scoped version, identity is never masked —
 // site admins can see exactly who (including other site admins) performed each action.
@@ -1387,9 +1433,18 @@ app.get('/hall/roundrobin-tournaments/:id', requireAuth, requireHallAuth, async 
 app.put('/hall/roundrobin-tournaments/:id', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   const { name, status, config } = req.body;
-  const validStatuses = ['setup', 'running', 'finished'];
+  // 'finished' is deliberately excluded here (Phase 5, 2026-09-07+) — finishing now
+  // ALWAYS goes through the dedicated PUT .../status route below, which upserts
+  // roundrobin_player_stats before logging the 'finished' audit action. Allowing a
+  // finish through this generic route would flip status without ever running that
+  // upsert, silently skipping lifetime stats for that tournament.
+  const validStatuses = ['setup', 'running'];
   if (status && !validStatuses.includes(status)) {
-    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+    return res.status(400).json({
+      error: status === 'finished'
+        ? `Use PUT /hall/roundrobin-tournaments/:id/status to finish a tournament -- it upserts lifetime stats.`
+        : `status must be one of: ${validStatuses.join(', ')}`
+    });
   }
   try {
     // Read the current row first — the audit log needs the OLD status, which a
@@ -1416,19 +1471,119 @@ app.put('/hall/roundrobin-tournaments/:id', requireAuth, requireHallAdmin, async
         [name || null, status || null, config ? JSON.stringify(config) : null, id, req.hallId]
       );
 
-      // A transition INTO 'finished' logs as its own 'finished' action rather than a
-      // generic 'status_change', so completion reads the same across modules (Try
-      // League emits 'finished' from its public finish route). old_status is kept in
-      // detail so nothing is lost by not using status_change here. When Phase 5 adds
-      // a dedicated PUT .../status route, move this call there.
+      // Only setup<->running transitions land here now — 'finished' is handled
+      // exclusively by the dedicated PUT .../status route (Phase 5, 2026-09-07+),
+      // which upserts roundrobin_player_stats before logging its own 'finished'
+      // audit action. See the validStatuses comment above.
       if (status && status !== oldStatus) {
-        const isFinish = status === 'finished';
         await logEventAudit(client, {
           poolhallId: req.hallId, eventType: 'round_robin', eventId: id,
-          action: isFinish ? 'finished' : 'status_change', req, snapshot: result.rows[0],
+          action: 'status_change', req, snapshot: result.rows[0],
           detail: { old_status: oldStatus, new_status: status }
         });
       }
+
+      await client.query('COMMIT');
+      res.json({ tournament: result.rows[0] });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/roundrobin-tournaments/:id/status ────────────────────────────────
+// Phase 5 (2026-09-07+). The ONLY way a tournament transitions to 'finished' —
+// see the validStatuses comment on the generic PUT above. Manual only, per the
+// Auto-close decision in context_round_robin.md: no automatic finish on
+// "all scores in", because bye rows never leave pending and entered-vs-confirmed
+// is a real distinction post-4b. Idempotent if already finished.
+app.put('/hall/roundrobin-tournaments/:id/status', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const current = await pool.query(
+      `SELECT tournament_id, status, config FROM roundrobin_tournaments
+       WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (current.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    const tournament = current.rows[0];
+
+    if (tournament.status === 'finished') {
+      const full = await pool.query(
+        `SELECT tournament_id, poolhall_id, name, status, config, public_id, created_at, updated_at
+         FROM roundrobin_tournaments WHERE tournament_id = $1`,
+        [id]
+      );
+      return res.json({ tournament: full.rows[0] });
+    }
+    if (tournament.status !== 'running') {
+      return res.status(409).json({ error: 'Tournament must be running to finish' });
+    }
+
+    // Reuse the exact same standings math the Standings tab and public report page
+    // already trust (computeRoundRobinStandings, defined above) — lifetime stats
+    // must never fork this calculation from what the hall was just looking at.
+    const playersResult = await pool.query(
+      `SELECT rtp.player_id, rtp.group_idx, rtp.seed_rating, p.first_name, p.last_name, p.hall_rating
+       FROM roundrobin_tournament_players rtp
+       JOIN player p ON p.player_id = rtp.player_id
+       WHERE rtp.tournament_id = $1`,
+      [id]
+    );
+    const matchesResult = await pool.query(
+      `SELECT match_id, group_idx, round_num, match_num, p1_id, p2_id,
+              score1, score2, winner_id, is_bye, is_makeup, status
+       FROM roundrobin_matches WHERE tournament_id = $1`,
+      [id]
+    );
+    const standings = computeRoundRobinStandings(tournament.config || {}, playersResult.rows, matchesResult.rows);
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        `UPDATE roundrobin_tournaments SET status = 'finished', updated_at = NOW()
+         WHERE tournament_id = $1 AND poolhall_id = $2
+         RETURNING tournament_id, poolhall_id, name, status, config, public_id, created_at, updated_at`,
+        [id, req.hallId]
+      );
+
+      // One upsert per player, folded across every group in this tournament —
+      // there is exactly one roundrobin_player_stats row per (player, hall),
+      // same pattern as tryleague_player_stats / chip_player_stats.
+      for (const group of standings.groups) {
+        for (const p of group.players) {
+          await client.query(
+            `INSERT INTO roundrobin_player_stats
+               (player_id, poolhall_id, tournaments, wins, losses, byes, ball_points, handicap_points, last_played_at, updated_at)
+             VALUES ($1, $2, 1, $3, $4, $5, $6, $7, NOW(), NOW())
+             ON CONFLICT (player_id, poolhall_id) DO UPDATE SET
+               tournaments     = roundrobin_player_stats.tournaments     + 1,
+               wins            = roundrobin_player_stats.wins            + EXCLUDED.wins,
+               losses          = roundrobin_player_stats.losses          + EXCLUDED.losses,
+               byes            = roundrobin_player_stats.byes            + EXCLUDED.byes,
+               ball_points     = roundrobin_player_stats.ball_points     + EXCLUDED.ball_points,
+               handicap_points = roundrobin_player_stats.handicap_points + EXCLUDED.handicap_points,
+               last_played_at  = NOW(),
+               updated_at      = NOW()`,
+            [p.player_id, req.hallId, p.wins, p.losses, p.byes, p.ball_points, p.handicap_bonus]
+          );
+        }
+      }
+
+      // Emits 'finished' directly (not 'status_change') so completion reads the
+      // same across modules — matches Try League's public finish route and Chip's
+      // isNewFinish branch. old_status is always 'running' to reach this point.
+      await logEventAudit(client, {
+        poolhallId: req.hallId, eventType: 'round_robin', eventId: id,
+        action: 'finished', req, snapshot: result.rows[0],
+        detail: { old_status: 'running', new_status: 'finished' }
+      });
 
       await client.query('COMMIT');
       res.json({ tournament: result.rows[0] });
