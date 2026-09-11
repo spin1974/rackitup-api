@@ -2804,6 +2804,202 @@ app.get('/hall/roundrobin-tournaments/:id/standings', requireAuth, requireHallAu
   }
 });
 
+// ── GET /hall/roundrobin-tag-standings ────────────────────────────────────────
+// Round Robin Phase 6 companion to /hall/tryleague-tag-standings — live-query
+// aggregate across every GROUP (not tournament) carrying any of the given tags.
+// See context_round_robin.md Phase 6 and context_tags_general.md §2g/§7: tags
+// are group-scoped here, so the aggregation key is (tournament_id, group_idx)
+// pairs, not whole tournaments. tag_ids is OPTIONAL, comma-separated, OR
+// semantics — omitted means every group across every tournament at this hall;
+// given multiple ids means every group carrying ANY of them. OR (not AND) is
+// deliberate: the motivating case is a player promoted from a U14 group to a
+// U18 group mid-season — filtering on {U14, U18} together is how their combined
+// record shows up, since each of their individual games only ever lived in one
+// bracket's group.
+//
+// Does NOT re-derive the bye/handicap/make-up math itself. Each tournament in
+// scope gets computeRoundRobinStandings() called on it exactly once, with its
+// own full player/match rows (that function's dedup logic — bye credit,
+// per-round handicap, make-up compensation — is keyed by player_id/round_num
+// and is only correct when run per-tournament; combining raw match rows from
+// several tournaments into one call would let round numbers from different
+// tournaments collide). Only the resulting per-group player rows for groups
+// that matched the tag filter are then summed across tournaments. This keeps
+// the already-trusted single-tournament math as the only place that logic
+// lives — this route just decides which of its outputs to add together.
+//
+// A player's stats are always ONE row here too, same principle as Try League's
+// version — no per-tag partitioning, just a `tags` badge array of every tag
+// any of their in-scope groups carried.
+app.get('/hall/roundrobin-tag-standings', requireAuth, requireHallAuth, async (req, res) => {
+  let tagIds = [];
+  if (req.query.tag_ids) {
+    tagIds = String(req.query.tag_ids).split(',').map(s => parseInt(s, 10)).filter(n => !isNaN(n));
+  }
+
+  try {
+    let tags = [];
+    if (tagIds.length) {
+      const tagResult = await pool.query(
+        `SELECT id, name, is_active FROM event_tags WHERE id = ANY($1::int[]) AND poolhall_id = $2`,
+        [tagIds, req.hallId]
+      );
+      tags = tagResult.rows;
+      if (tags.length === 0) return res.status(404).json({ error: 'No matching tags found' });
+      tagIds = tags.map(t => t.id);
+    }
+
+    // scopePairs: tournament_id -> Set<group_idx> to include, or null meaning
+    // "every group in this tournament" (the unfiltered/no-tag-selected case).
+    const scopePairs = new Map();
+    if (tagIds.length) {
+      const pairsResult = await pool.query(
+        `SELECT rret.tournament_id, rret.group_idx
+           FROM round_robin_event_tags rret
+           JOIN roundrobin_tournaments rt ON rt.tournament_id = rret.tournament_id
+          WHERE rret.tag_id = ANY($1::int[]) AND rt.poolhall_id = $2`,
+        [tagIds, req.hallId]
+      );
+      for (const r of pairsResult.rows) {
+        if (!scopePairs.has(r.tournament_id)) scopePairs.set(r.tournament_id, new Set());
+        scopePairs.get(r.tournament_id).add(r.group_idx);
+      }
+    } else {
+      const allResult = await pool.query(
+        `SELECT tournament_id FROM roundrobin_tournaments WHERE poolhall_id = $1`,
+        [req.hallId]
+      );
+      for (const r of allResult.rows) scopePairs.set(r.tournament_id, null);
+    }
+
+    if (scopePairs.size === 0) {
+      return res.json({ tags, tournament_count: 0, players: [] });
+    }
+
+    const tournamentIds = [...scopePairs.keys()];
+
+    // Every tag attached to every group of every in-scope tournament — powers
+    // each player's `tags` badge list below. Independent of whether this
+    // request was itself tag_ids-filtered (a group can carry more than one tag,
+    // same as an event can in Try League).
+    const groupTagsResult = await pool.query(
+      `SELECT rret.tournament_id, rret.group_idx, et.id, et.name
+         FROM round_robin_event_tags rret
+         JOIN event_tags et ON et.id = rret.tag_id
+        WHERE rret.tournament_id = ANY($1::int[])`,
+      [tournamentIds]
+    );
+    const tagsByPair = new Map(); // "tournamentId:groupIdx" -> [{id,name}]
+    for (const r of groupTagsResult.rows) {
+      const key = `${r.tournament_id}:${r.group_idx}`;
+      if (!tagsByPair.has(key)) tagsByPair.set(key, []);
+      tagsByPair.get(key).push({ id: r.id, name: r.name });
+    }
+
+    const agg = new Map(); // player_id -> running totals
+    const ensureAgg = (id) => {
+      if (!agg.has(id)) {
+        agg.set(id, {
+          first_name: '', last_name: '', hall_rating: null,
+          wins: 0, losses: 0, byes: 0, ball_points: 0, handicap_bonus: 0,
+          tournamentIds: new Set(), tagIds: new Set(), tags: []
+        });
+      }
+    };
+
+    for (const tournamentId of tournamentIds) {
+      const groupScope = scopePairs.get(tournamentId); // Set or null
+
+      const tRes = await pool.query(
+        `SELECT tournament_id, config FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+        [tournamentId, req.hallId]
+      );
+      if (tRes.rows.length === 0) continue;
+      const config = tRes.rows[0].config || {};
+
+      const pRes = await pool.query(
+        `SELECT rtp.player_id, rtp.group_idx, rtp.seed_rating, p.first_name, p.last_name, p.hall_rating
+           FROM roundrobin_tournament_players rtp
+           JOIN player p ON p.player_id = rtp.player_id
+          WHERE rtp.tournament_id = $1`,
+        [tournamentId]
+      );
+      const mRes = await pool.query(
+        `SELECT match_id, group_idx, round_num, match_num, p1_id, p2_id,
+                score1, score2, winner_id, is_bye, is_makeup, status
+           FROM roundrobin_matches
+          WHERE tournament_id = $1
+          ORDER BY group_idx, round_num, match_id`,
+        [tournamentId]
+      );
+
+      const { groups } = computeRoundRobinStandings(config, pRes.rows, mRes.rows);
+
+      for (const g of groups) {
+        if (groupScope !== null && !groupScope.has(g.group_idx)) continue;
+        const groupTagList = tagsByPair.get(`${tournamentId}:${g.group_idx}`) || [];
+        for (const p of g.players) {
+          ensureAgg(p.player_id);
+          const a = agg.get(p.player_id);
+          a.first_name     = p.first_name;
+          a.last_name      = p.last_name;
+          a.hall_rating    = p.hall_rating;
+          a.wins           += p.wins;
+          a.losses         += p.losses;
+          a.byes           += p.byes;
+          a.ball_points    += p.ball_points;
+          a.handicap_bonus += p.handicap_bonus;
+          a.tournamentIds.add(tournamentId);
+          for (const t of groupTagList) {
+            if (!a.tagIds.has(t.id)) { a.tagIds.add(t.id); a.tags.push(t); }
+          }
+        }
+      }
+    }
+
+    if (agg.size === 0) {
+      return res.json({ tags, tournament_count: scopePairs.size, players: [] });
+    }
+
+    const players = [...agg.entries()].map(([player_id, a]) => {
+      const handicap_bonus = Math.round(a.handicap_bonus * 100) / 100;
+      const total_points   = Math.round((a.wins + handicap_bonus) * 100) / 100;
+      return {
+        player_id,
+        first_name: a.first_name || '',
+        last_name: a.last_name || '',
+        hall_rating: a.hall_rating != null ? Number(a.hall_rating) : null,
+        tournaments_played: a.tournamentIds.size,
+        wins: a.wins,
+        losses: a.losses,
+        byes: a.byes,
+        ball_points: a.ball_points,
+        handicap_bonus,
+        total_points,
+        tags: a.tags.sort((x, y) => x.name.localeCompare(y.name))
+      };
+    }).sort((x, y) => (y.total_points - x.total_points) || (y.ball_points - x.ball_points));
+
+    // Standard competition ranking across the WHOLE combined leaderboard (not
+    // per-group — there is no group here, this is one cross-tournament board).
+    let place = 0;
+    players.forEach((p, i) => {
+      const prev = players[i - 1];
+      const tied = prev && prev.total_points === p.total_points && prev.ball_points === p.ball_points;
+      if (!tied) place = i + 1;
+      p.placement = place;
+      p.shared_placement = false;
+    });
+    for (const p of players) {
+      if (players.filter(q => q.placement === p.placement).length > 1) p.shared_placement = true;
+    }
+
+    res.json({ tags, tournament_count: scopePairs.size, players });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── GET /public/roundrobin-tournaments/:publicId ────────────────────────────────
 // Phase 4c. No auth — public report page (reports/roundrobin.html): roster,
 // matches, and standings for read-only display. Looked up via public_id (opaque
@@ -4812,7 +5008,7 @@ function computeTryLeagueMatchDeltas(matchRows) {
 
 // ── GET /hall/tryleague-tag-standings ─────────────────────────────────────────
 // Try League tag system Phase 5 (see context_tags_tl.md) — live-query cross-session
-// standings, optionally filtered by tag and/or bounded by date range. tag_id is
+// standings, optionally filtered by tag and/or bounded by date range. Tags are
 // OPTIONAL (2026-08-17 revision) — omitted means "every session at this hall in
 // range," matching reports/tl-players.html's lifetime-stats shape but computed
 // live instead of from the cached tryleague_player_stats table, so tag membership
@@ -4823,39 +5019,54 @@ function computeTryLeagueMatchDeltas(matchRows) {
 // per-event config (e.g. different group sizes under one tag) is not flagged in
 // this version — also deferred per the doc.
 // A player's stats are always ONE row, never split per tag — tags are informational
-// (see each player's `tags` array below), not a partition key. If tag_id IS given,
-// every session in scope carries that tag, so `tags` will just echo it back per
-// player; if tag_id is omitted, `tags` shows every tag that player has encountered
-// across the sessions in range (which may be several, or none).
-// Query params: tag_id (optional), from / to (optional, YYYY-MM-DD, inclusive,
-// filtered against COALESCE(started_at, created_at)::date).
+// (see each player's `tags` array below), not a partition key. If tag_ids IS given,
+// every session in scope carries at least one of them (OR, not AND — the motivating
+// case is exactly "filter on both U14 and U18 together" for a player who moved
+// brackets mid-season), so `tags` will echo back whichever of the selected tags that
+// session actually carries; if tag_ids is omitted, `tags` shows every tag that
+// player has encountered across the sessions in range (which may be several, or
+// none).
+// Query params: tag_ids (optional, comma-separated — added 2026-09-11 for the
+// unified Standings module's multi-select filter), tag_id (optional, single —
+// kept for backward compatibility with existing bookmarks/links), from / to
+// (optional, YYYY-MM-DD, inclusive, filtered against COALESCE(started_at, created_at)::date).
 app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (req, res) => {
-  const tagId = req.query.tag_id ? parseInt(req.query.tag_id, 10) : null;
+  let tagIds = [];
+  if (req.query.tag_ids) {
+    tagIds = String(req.query.tag_ids).split(',').map(s => parseInt(s, 10)).filter(n => !isNaN(n));
+  } else if (req.query.tag_id) {
+    const single = parseInt(req.query.tag_id, 10);
+    if (!isNaN(single)) tagIds = [single];
+  }
   const { from, to } = req.query;
 
   try {
-    let tag = null;
-    if (tagId) {
+    let tags = [];
+    if (tagIds.length) {
       const tagResult = await pool.query(
-        `SELECT id, name, is_active FROM event_tags WHERE id = $1 AND poolhall_id = $2`,
-        [tagId, req.hallId]
+        `SELECT id, name, is_active FROM event_tags WHERE id = ANY($1::int[]) AND poolhall_id = $2`,
+        [tagIds, req.hallId]
       );
-      if (tagResult.rows.length === 0) return res.status(404).json({ error: 'Tag not found' });
-      tag = tagResult.rows[0];
+      tags = tagResult.rows;
+      if (tags.length === 0) return res.status(404).json({ error: 'No matching tags found' });
+      tagIds = tags.map(t => t.id); // drop any ids that didn't belong to this hall
     }
 
     const dateConditions = [];
-    const params = tagId ? [tagId, req.hallId] : [req.hallId];
+    const params = tagIds.length ? [tagIds, req.hallId] : [req.hallId];
     if (from) { params.push(from); dateConditions.push(`COALESCE(s.started_at, s.created_at)::date >= $${params.length}::date`); }
     if (to)   { params.push(to);   dateConditions.push(`COALESCE(s.started_at, s.created_at)::date <= $${params.length}::date`); }
     const dateClause = dateConditions.length ? `AND ${dateConditions.join(' AND ')}` : '';
 
+    // DISTINCT matters here in a way it didn't for a single tag_id: a session
+    // carrying two of the selected tags would otherwise join twice and count
+    // its matches twice toward every player's totals.
     const sessionsResult = await pool.query(
-      tagId
-        ? `SELECT s.session_id, s.name, s.status, s.started_at, s.created_at
+      tagIds.length
+        ? `SELECT DISTINCT s.session_id, s.name, s.status, s.started_at, s.created_at
            FROM tryleague_sessions s
            JOIN try_league_event_tags tlet ON tlet.event_id = s.session_id
-           WHERE tlet.tag_id = $1 AND s.poolhall_id = $2 ${dateClause}
+           WHERE tlet.tag_id = ANY($1::int[]) AND s.poolhall_id = $2 ${dateClause}
            ORDER BY COALESCE(s.started_at, s.created_at) ASC`
         : `SELECT s.session_id, s.name, s.status, s.started_at, s.created_at
            FROM tryleague_sessions s
@@ -4865,7 +5076,7 @@ app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (re
     );
     const sessions = sessionsResult.rows;
     if (sessions.length === 0) {
-      return res.json({ tag, sessions: [], players: [] });
+      return res.json({ tags, sessions: [], players: [] });
     }
     const sessionIds = sessions.map(s => s.session_id);
 
@@ -4934,7 +5145,7 @@ app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (re
     }
 
     if (agg.size === 0) {
-      return res.json({ tag, sessions: sessions.map(s => ({ session_id: s.session_id, name: s.name, status: s.status })), players: [] });
+      return res.json({ tags, sessions: sessions.map(s => ({ session_id: s.session_id, name: s.name, status: s.status })), players: [] });
     }
 
     const playerIds = [...agg.keys()];
@@ -4963,7 +5174,7 @@ app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (re
     });
 
     res.json({
-      tag,
+      tags,
       sessions: sessions.map(s => ({ session_id: s.session_id, name: s.name, status: s.status })),
       players
     });
