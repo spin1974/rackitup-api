@@ -1717,6 +1717,91 @@ app.delete('/hall/roundrobin-tournaments/:id/players/:pid', requireAuth, require
   }
 });
 
+// ── GET /hall/roundrobin-tournaments/:id/tags ────────────────────────────────
+// Round Robin Phase 6 — group-scoped event tags (see context_round_robin.md
+// Phase 6, decided 2026-09-10, and context_tags_general.md §2a). Tags attach
+// to a (tournament_id, group_idx) pair, never to the whole tournament and
+// never to a player or a match row. Returns every group's tags for this
+// tournament in one call so the Groups tab can render all cards without N
+// round trips: { group_tags: [{ group_idx, id, name, is_active }, ...] }
+app.get('/hall/roundrobin-tournaments/:id/tags', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const own = await pool.query(
+      `SELECT tournament_id FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (own.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    const result = await pool.query(
+      `SELECT rret.group_idx, et.id, et.name, et.is_active
+       FROM round_robin_event_tags rret
+       JOIN event_tags et ON et.id = rret.tag_id
+       WHERE rret.tournament_id = $1
+       ORDER BY rret.group_idx ASC, et.name ASC`,
+      [id]
+    );
+    res.json({ group_tags: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/roundrobin-tournaments/:id/groups/:group_idx/tags ──────────────
+// Full replace for one group only — body: { tag_ids: [...] }. Mirrors
+// PUT /hall/tryleague-sessions/:id/tags, scoped one level deeper (group,
+// not event). No status restriction — tags can be set/changed at any point
+// in the tournament's lifecycle, same as Try League's event-level version.
+app.put('/hall/roundrobin-tournaments/:id/groups/:group_idx/tags', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, group_idx } = req.params;
+  const gi = parseInt(group_idx);
+  if (!Number.isInteger(gi) || gi < 0) return res.status(400).json({ error: 'Invalid group_idx' });
+  const tagIds = Array.isArray(req.body.tag_ids) ? req.body.tag_ids : [];
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const own = await client.query(
+      `SELECT tournament_id FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (own.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Tournament not found' });
+    }
+    if (tagIds.length > 0) {
+      const validTags = await client.query(
+        `SELECT id FROM event_tags WHERE poolhall_id = $1 AND id = ANY($2::int[])`,
+        [req.hallId, tagIds]
+      );
+      if (validTags.rows.length !== tagIds.length) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'One or more tag_ids are invalid for this hall' });
+      }
+    }
+    await client.query(`DELETE FROM round_robin_event_tags WHERE tournament_id = $1 AND group_idx = $2`, [id, gi]);
+    for (const tagId of tagIds) {
+      await client.query(
+        `INSERT INTO round_robin_event_tags (tournament_id, group_idx, tag_id) VALUES ($1, $2, $3)`,
+        [id, gi, tagId]
+      );
+    }
+    const result = await client.query(
+      `SELECT et.id, et.name, et.is_active
+       FROM round_robin_event_tags rret
+       JOIN event_tags et ON et.id = rret.tag_id
+       WHERE rret.tournament_id = $1 AND rret.group_idx = $2
+       ORDER BY et.name ASC`,
+      [id, gi]
+    );
+    await client.query('COMMIT');
+    res.json({ group_idx: gi, tags: result.rows });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ── POST /hall/roundrobin-tournaments/:id/schedule ────────────────────────────
 // Generates groups + full match schedule. Deletes any existing matches first.
 // Transitions tournament status → 'running'.
