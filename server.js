@@ -5061,13 +5061,25 @@ app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (re
     // DISTINCT matters here in a way it didn't for a single tag_id: a session
     // carrying two of the selected tags would otherwise join twice and count
     // its matches twice toward every player's totals.
+    // sort_key alias (2026-09-13 fix): Postgres requires a SELECT DISTINCT
+    // query's ORDER BY expression to appear literally in the select list —
+    // `ORDER BY COALESCE(s.started_at, s.created_at)` doesn't match any
+    // selected column even though both underlying columns are selected
+    // separately, and errors with "for SELECT DISTINCT, ORDER BY expressions
+    // must appear in select list". This wasn't tag-specific — any tag_ids
+    // filter on Try League standings hit it, since the multi-tag path always
+    // uses DISTINCT (see comment above); it just hadn't been exercised until
+    // the unified Standings page's multi-select filter (2026-09-11) made
+    // selecting a tag this easy. Fixed by aliasing the same expression and
+    // ordering by the alias instead.
     const sessionsResult = await pool.query(
       tagIds.length
-        ? `SELECT DISTINCT s.session_id, s.name, s.status, s.started_at, s.created_at
+        ? `SELECT DISTINCT s.session_id, s.name, s.status, s.started_at, s.created_at,
+                  COALESCE(s.started_at, s.created_at) AS sort_key
            FROM tryleague_sessions s
            JOIN try_league_event_tags tlet ON tlet.event_id = s.session_id
            WHERE tlet.tag_id = ANY($1::int[]) AND s.poolhall_id = $2 ${dateClause}
-           ORDER BY COALESCE(s.started_at, s.created_at) ASC`
+           ORDER BY sort_key ASC`
         : `SELECT s.session_id, s.name, s.status, s.started_at, s.created_at
            FROM tryleague_sessions s
            WHERE s.poolhall_id = $1 ${dateClause}
