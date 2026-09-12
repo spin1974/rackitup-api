@@ -5335,8 +5335,61 @@ app.get('/public/poolhalls/:publicId/tl-player-stats', async (req, res) => {
   }
 });
 
+// ── GET /public/poolhalls/:publicId/rr-player-stats ─────────────────────────
+// No auth required. Returns lifetime Round Robin stats for all players at a hall.
+// Identified by the hall's public_id (opaque 12-char token, not the internal
+// poolhall_id) — same pattern as the Try League equivalent above and every
+// other public Round Robin route (entry_token, roundrobin_tournaments.public_id).
+// Added 2026-09-13 as Round Robin's third score-sheet QR, matching Try League's
+// existing "Player Stats" QR (reports/tl-players.html).
+//
+// total_points is computed here rather than left to the client: it's
+// wins + handicap_points, the same "handicap folds INTO placement" rule
+// locked for Round Robin standings on 2026-07-18 — the default sort on this
+// page uses it, not a raw win count, so the ranking stays consistent with
+// every other Round Robin standings surface in the app.
+app.get('/public/poolhalls/:publicId/rr-player-stats', async (req, res) => {
+  const { publicId } = req.params;
+  try {
+    const hallResult = await pool.query(
+      `SELECT poolhall_id, poolhall_name FROM poolhall WHERE public_id = $1`,
+      [publicId]
+    );
+    if (hallResult.rows.length === 0) return res.status(404).json({ error: 'Hall not found' });
 
-// ── Shared helper — derivePlayingDates ─────────────────────────────────────────
+    const { poolhall_id, poolhall_name } = hallResult.rows[0];
+
+    const result = await pool.query(
+      `SELECT
+         p.player_id,
+         p.first_name,
+         p.last_name,
+         p.hall_rating,
+         p.fargo_rating,
+         COALESCE(s.tournaments, 0)  AS tournaments_played,
+         COALESCE(s.wins,        0)  AS total_wins,
+         COALESCE(s.losses,      0)  AS total_losses,
+         COALESCE(s.ball_points, 0)  AS total_ball_points,
+         ROUND((COALESCE(s.wins,0) + COALESCE(s.handicap_points,0))::numeric, 2) AS total_points,
+         s.last_played_at
+       FROM player p
+       LEFT JOIN roundrobin_player_stats s
+         ON s.player_id = p.player_id AND s.poolhall_id = $1
+       WHERE p.poolhall_id = $1
+         AND p.deleted_at IS NULL
+         AND s.player_id IS NOT NULL
+       ORDER BY total_points DESC NULLS LAST, p.last_name, p.first_name`,
+      [poolhall_id]
+    );
+
+    res.json({
+      poolhall_name,
+      players: result.rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 // Walks from league.start_date to league.end_date, collecting dates matching
 // playing_day, minus any in skip_dates. Used by both POST /generate-schedule
 // (random leagues, pre-activation) and POST /activate (league_nights creation,
