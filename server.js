@@ -2361,11 +2361,12 @@ app.put('/hall/roundrobin-tournaments/:id/matches/:matchId', requireAuth, requir
       // non-scoring body who plays but records nothing. The sum-to-17 rule does
       // not apply here because there is no second score to sum against.
       //
-      // OPEN — CONFIRM WITH CHRIS BEFORE A REAL ODD-PLAYER TOURNAMENT RUNS.
-      // The make-up path (built 2026-06-13) has never been exercised; the
-      // 2026-09-06 verification used 10 players so hasBye was false throughout.
-      // Two assumptions are baked in here: (1) only score1 is recorded, (2) p1 is
-      // credited the win when score1 >= 10 and nobody is credited otherwise.
+      // CONFIRMED 2026-09-13 on a real 26-player run (two odd-man-out cases,
+      // Frank Foster and Uma Underwood). Two assumptions are baked in here:
+      // (1) only score1 is recorded, (2) p1 wins when score1 >= 10 and LOSES
+      // otherwise — winner_id stays null on that loss (no real p2 to be "the
+      // winner"), which is exactly what computeRoundRobinStandings() now
+      // checks for explicitly to credit the loss. See the BUG FIX note there.
       if (v2.value !== null) {
         await client.query('ROLLBACK');
         return res.status(400).json({ error: 'Make-up rounds record only the bye player\'s score — the second player is a non-scoring body.' });
@@ -2661,10 +2662,30 @@ function computeRoundRobinStandings(config, playerRows, matchRows) {
         r2.ball_points += Number(m.score2) || 0;
       }
 
-      if (m.winner_id && rows.has(m.winner_id)) rows.get(m.winner_id).wins += 1;
-      if (m.winner_id && !m.is_makeup) {
-        const loserId = m.winner_id === m.p1_id ? m.p2_id : m.p1_id;
-        if (loserId && rows.has(loserId)) rows.get(loserId).losses += 1;
+      // BUG FIX (2026-09-13): a make-up row's winner_id is null whenever the
+      // bye player LOSES (score1 < 10) — see PUT .../matches/:matchId, which
+      // only ever sets winner_id to p1_id on a win, and leaves it null
+      // otherwise since there's no real p2 who could be "the winner". The
+      // generic winner_id branch below can only ever credit a WIN off that
+      // (a null winner_id fails the truthy check), so a make-up LOSS for the
+      // bye player was silently dropped from both wins and losses — found
+      // live 2026-09-13: Frank Foster's W+L summed to 13 instead of 15,
+      // exactly the 2 losses missing from his 1W/2L make-up block. Wins on a
+      // make-up row were never affected (a win does set winner_id), which is
+      // why this stayed invisible on any odd-man-out who happened to sweep
+      // their make-up block (e.g. Uma Underwood, 3W/0L that same night —
+      // nothing to drop).
+      if (m.is_makeup) {
+        if (r1) {
+          if (m.winner_id === m.p1_id) r1.wins += 1;
+          else r1.losses += 1;
+        }
+      } else {
+        if (m.winner_id && rows.has(m.winner_id)) rows.get(m.winner_id).wins += 1;
+        if (m.winner_id) {
+          const loserId = m.winner_id === m.p1_id ? m.p2_id : m.p1_id;
+          if (loserId && rows.has(loserId)) rows.get(loserId).losses += 1;
+        }
       }
 
       // Handicap: paid to the LOWER-rated player of the pairing, matching the
