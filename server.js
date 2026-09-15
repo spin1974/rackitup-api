@@ -1665,7 +1665,7 @@ app.post('/hall/roundrobin-tournaments/:id/players', requireAuth, requireHallAdm
   if (!player_id) return res.status(400).json({ error: 'player_id is required' });
   try {
     const tCheck = await pool.query(
-      `SELECT tournament_id, status FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      `SELECT tournament_id, status, config FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
       [id, req.hallId]
     );
     if (tCheck.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
@@ -1678,19 +1678,111 @@ app.post('/hall/roundrobin-tournaments/:id/players', requireAuth, requireHallAdm
     if (pCheck.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
 
     const seedRating = pCheck.rows[0].hall_rating || null;
+
+    // Default group_idx for a fresh registration (added 2026-09-14, group-
+    // assignment persistence). If a group draft already exists (someone has
+    // opened the Groups tab and set a group count / assignments), a new
+    // player registered from EITHER device — desktop or mobile — lands in
+    // the smallest group instead of sitting ungrouped, so registration and
+    // group-assignment can genuinely happen on two different devices without
+    // one silently waiting on the other. Ties resolve to the LAST group
+    // index (Chris, 2026-09-14: "if there's no smallest group... if there's
+    // three groups it should go in the third"). If no draft exists yet
+    // (nobody has touched Groups), group_idx stays NULL and the Groups tab's
+    // original full auto-seed-by-rating takes over the first time it opens.
+    const draftGroups = tCheck.rows[0].config?.draft_group_config?.groups;
+    let defaultGroupIdx = null;
+    if (Number.isInteger(draftGroups) && draftGroups > 0) {
+      const countsResult = await pool.query(
+        `SELECT group_idx, COUNT(*) AS c FROM roundrobin_tournament_players
+         WHERE tournament_id = $1 AND group_idx IS NOT NULL
+         GROUP BY group_idx`,
+        [id]
+      );
+      const counts = new Array(draftGroups).fill(0);
+      countsResult.rows.forEach(r => {
+        const gi = r.group_idx;
+        if (gi >= 0 && gi < draftGroups) counts[gi] = parseInt(r.c, 10);
+      });
+      const minCount = Math.min(...counts);
+      for (let gi = draftGroups - 1; gi >= 0; gi--) {
+        if (counts[gi] === minCount) { defaultGroupIdx = gi; break; }
+      }
+    }
+
     // Phase 4b: every roster row carries a random entry token. The printed score
     // sheet's entry QR encodes THIS, never the player_id - a sequential id in a
     // public URL would let anyone edit anyone's scores by counting upward.
     const entryToken = crypto.randomBytes(16).toString('hex');
     const result = await pool.query(
-      `INSERT INTO roundrobin_tournament_players (tournament_id, player_id, seed_rating, entry_token, created_at)
-       VALUES ($1, $2, $3, $4, NOW())
+      `INSERT INTO roundrobin_tournament_players (tournament_id, player_id, group_idx, seed_rating, entry_token, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
        ON CONFLICT (tournament_id, player_id) DO NOTHING
        RETURNING tournament_player_id, tournament_id, player_id, group_idx, seed_rating, entry_token, created_at`,
-      [id, player_id, seedRating, entryToken]
+      [id, player_id, defaultGroupIdx, seedRating, entryToken]
     );
     if (!result.rows.length) return res.status(409).json({ error: 'Player already registered' });
     res.status(201).json({ player: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PUT /hall/roundrobin-tournaments/:id/group-assignments ───────────────────
+// Persists in-progress Groups-tab state BEFORE schedule generation — player->
+// group placements and each group's draft Rounds/Games — so it survives a
+// navigation, a page reload, or switching to a different device mid-session
+// (added 2026-09-14, Chris: "we bounce between devices, one for registration,
+// one for group assignment"). Distinct from POST .../schedule below, which is
+// the separate, destructive step that actually generates match rows and flips
+// status to 'running'. This route never touches roundrobin_matches and never
+// changes status. Called debounced on every drag-drop and every Rounds/Games
+// edit, and once on a group-count change — routine, high-frequency writes, so
+// deliberately NOT logged to event_audit_log (same "columns for current
+// state, audit log for the trail" call made for score entries).
+app.put('/hall/roundrobin-tournaments/:id/group-assignments', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { groups, group_assignments, group_config } = req.body;
+  if (!Number.isInteger(groups) || groups < 1) return res.status(400).json({ error: 'groups must be a positive integer' });
+  if (!Array.isArray(group_assignments)) return res.status(400).json({ error: 'group_assignments must be an array' });
+  try {
+    const tCheck = await pool.query(
+      `SELECT tournament_id, config FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+      [id, req.hallId]
+    );
+    if (tCheck.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const a of group_assignments) {
+        if (!Number.isInteger(a.group_idx) || a.group_idx < 0 || a.group_idx >= groups) continue;
+        await client.query(
+          `UPDATE roundrobin_tournament_players SET group_idx = $1
+           WHERE tournament_id = $2 AND player_id = $3`,
+          [a.group_idx, id, a.player_id]
+        );
+      }
+      // Merge into config rather than a blind replace — this route only owns
+      // the draft_group_config key; entry_fee/self_entry/handicap_grid/etc.
+      // must survive untouched. (The generic PUT /:id route replaces config
+      // wholesale, which is fine for its own callers but wrong here.)
+      const currentConfig = tCheck.rows[0].config || {};
+      const newConfig = { ...currentConfig, draft_group_config: { groups, group_config: group_config || [] } };
+      const result = await client.query(
+        `UPDATE roundrobin_tournaments SET config = $1, updated_at = NOW()
+         WHERE tournament_id = $2 AND poolhall_id = $3
+         RETURNING tournament_id, poolhall_id, name, status, config, public_id, created_at, updated_at`,
+        [JSON.stringify(newConfig), id, req.hallId]
+      );
+      await client.query('COMMIT');
+      res.json({ tournament: result.rows[0] });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
