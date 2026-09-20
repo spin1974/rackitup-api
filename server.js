@@ -3940,9 +3940,21 @@ app.get('/hall/tryleague-sessions', requireAuth, requireHallAuth, async (req, re
 });
 
 // ── POST /hall/tryleague-sessions ─────────────────────────────────────────────
+// Guard added 2026-09-19: only one active session at a time, mirroring Round
+// Robin's create-route guard. Concurrency (session switcher, roster-conflict
+// guard) removed the same day — see context_tl_group_tags_scope.md. Group-scoped
+// tags cover the multi-tier/multi-group need without running 2+ sessions at once.
 app.post('/hall/tryleague-sessions', requireAuth, requireHallAdmin, async (req, res) => {
   const { name, config } = req.body;
   try {
+    const active = await pool.query(
+      `SELECT session_id FROM tryleague_sessions
+       WHERE poolhall_id = $1 AND status IN ('setup', 'running') LIMIT 1`,
+      [req.hallId]
+    );
+    if (active.rows.length > 0) {
+      return res.status(409).json({ error: 'A session is already active. Finish it before starting a new one.' });
+    }
     const result = await pool.query(
       `INSERT INTO tryleague_sessions (poolhall_id, name, status, config, created_at)
        VALUES ($1, $2, 'setup', $3, NOW())
@@ -4215,30 +4227,13 @@ app.get('/hall/tryleague-sessions/:id/players', requireAuth, requireHallAuth, as
   }
 });
 
-// ── GET /hall/tryleague-sessions/:id/roster-conflicts ──────────────────────
-// Returns players already on another currently-active (setup/running) Try
-// League session's roster at this hall — used by the "Add Players" picker to
-// show "In {session}" and block selection, since a player can't be active on
-// two Try League rosters at once (Try League concurrency Phase 2).
-app.get('/hall/tryleague-sessions/:id/roster-conflicts', requireAuth, requireHallAuth, async (req, res) => {
-  const { id } = req.params;
-  try {
-    const own = await pool.query(`SELECT session_id FROM tryleague_sessions WHERE session_id = $1 AND poolhall_id = $2`, [id, req.hallId]);
-    if (own.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
-    const result = await pool.query(
-      `SELECT tsp.player_id, ts.session_id, ts.name AS session_name
-       FROM tryleague_session_players tsp
-       JOIN tryleague_sessions ts ON ts.session_id = tsp.session_id
-       WHERE ts.poolhall_id = $1 AND ts.status IN ('setup','running') AND ts.session_id != $2`,
-      [req.hallId, id]
-    );
-    res.json({ conflicts: result.rows });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ── POST /hall/tryleague-sessions/:id/players ─────────────────────────────────
+// The GET .../roster-conflicts route and the "player already on another active
+// session" 409 guard that used to live here were removed 2026-09-19 — with
+// only one active session per hall allowed (see the create-route guard above),
+// a player already registered on the one active session is just an ordinary
+// duplicate, handled by ON CONFLICT DO NOTHING below, not a cross-session
+// conflict. See context_tl_group_tags_scope.md.
 app.post('/hall/tryleague-sessions/:id/players', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   const { player_id } = req.body;
@@ -4248,26 +4243,6 @@ app.post('/hall/tryleague-sessions/:id/players', requireAuth, requireHallAdmin, 
     if (check.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
     const pc = await pool.query(`SELECT player_id FROM player WHERE player_id = $1 AND poolhall_id = $2 AND deleted_at IS NULL`, [player_id, req.hallId]);
     if (pc.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
-
-    // Guard: a player can't be rostered on two active (setup/running) Try
-    // League sessions at once. Client-side already filters this out of the
-    // picker, so hitting this is either a stale client view or a race between
-    // two admins — either way, block it rather than double-booking the player.
-    const conflict = await pool.query(
-      `SELECT ts.session_id, ts.name
-       FROM tryleague_session_players tsp
-       JOIN tryleague_sessions ts ON ts.session_id = tsp.session_id
-       WHERE tsp.player_id = $1 AND ts.poolhall_id = $2 AND ts.status IN ('setup','running') AND ts.session_id != $3`,
-      [player_id, req.hallId, id]
-    );
-    if (conflict.rows.length > 0) {
-      const other = conflict.rows[0];
-      return res.status(409).json({
-        error: `Player is already in "${other.name || 'another session'}"`,
-        conflicting_session_id: other.session_id,
-        conflicting_session_name: other.name
-      });
-    }
 
     const result = await pool.query(
       `INSERT INTO tryleague_session_players (session_id, player_id) VALUES ($1, $2)
