@@ -4048,6 +4048,14 @@ app.put('/hall/tryleague-sessions/:id/pin', requireAuth, requireHallAdmin, async
 });
 
 // ── GET /hall/tryleague-sessions/:id/tags ────────────────────────────────────
+// Redesigned 2026-09-19 (group-scoped, see context_tl_group_tags_scope.md):
+// a tag now attaches to a (session_id, group_idx) pair, never to the whole
+// session or to a player. Mirrors Round Robin's GET .../tags exactly. Returns
+// every group's tags for this session in one call: { group_tags: [{ group_idx,
+// id, name, is_active }, ...] }. The old whole-session shape ({ tags: [...] })
+// is gone — no production session had ever been tagged under it, confirmed
+// empty before this migration, so this was a clean replace, not a data
+// migration (see the scope doc's sequencing step 1).
 app.get('/hall/tryleague-sessions/:id/tags', requireAuth, requireHallAuth, async (req, res) => {
   const { id } = req.params;
   try {
@@ -4057,24 +4065,31 @@ app.get('/hall/tryleague-sessions/:id/tags', requireAuth, requireHallAuth, async
     );
     if (own.rows.length === 0) return res.status(404).json({ error: 'Session not found' });
     const result = await pool.query(
-      `SELECT et.id, et.name, et.is_active
+      `SELECT tlet.group_idx, et.id, et.name, et.is_active
        FROM try_league_event_tags tlet
        JOIN event_tags et ON et.id = tlet.tag_id
-       WHERE tlet.event_id = $1
-       ORDER BY et.name ASC`,
+       WHERE tlet.session_id = $1
+       ORDER BY tlet.group_idx ASC, et.name ASC`,
       [id]
     );
-    res.json({ tags: result.rows });
+    res.json({ group_tags: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── PUT /hall/tryleague-sessions/:id/tags ────────────────────────────────────
-// Full replace — body: { tag_ids: [...] }. No status restriction — tags can be
-// set/changed at any point in the event's lifecycle.
-app.put('/hall/tryleague-sessions/:id/tags', requireAuth, requireHallAdmin, async (req, res) => {
-  const { id } = req.params;
+// ── PUT /hall/tryleague-sessions/:id/groups/:group_idx/tags ──────────────────
+// Full replace for one group only — body: { tag_ids: [...] }. Mirrors
+// PUT /hall/roundrobin-tournaments/:id/groups/:group_idx/tags exactly. No
+// status restriction — tags can be set/changed at any point in the session's
+// lifecycle. group_idx is a plain integer attribute on this join table, same
+// as Round Robin's — it is never resolved against tryleague_session_players'
+// group_name; nothing here needs to know which players are actually in the
+// group.
+app.put('/hall/tryleague-sessions/:id/groups/:group_idx/tags', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, group_idx } = req.params;
+  const gi = parseInt(group_idx);
+  if (!Number.isInteger(gi) || gi < 0) return res.status(400).json({ error: 'Invalid group_idx' });
   const tagIds = Array.isArray(req.body.tag_ids) ? req.body.tag_ids : [];
   const client = await pool.connect();
   try {
@@ -4097,23 +4112,23 @@ app.put('/hall/tryleague-sessions/:id/tags', requireAuth, requireHallAdmin, asyn
         return res.status(400).json({ error: 'One or more tag_ids are invalid for this hall' });
       }
     }
-    await client.query(`DELETE FROM try_league_event_tags WHERE event_id = $1`, [id]);
+    await client.query(`DELETE FROM try_league_event_tags WHERE session_id = $1 AND group_idx = $2`, [id, gi]);
     for (const tagId of tagIds) {
       await client.query(
-        `INSERT INTO try_league_event_tags (event_id, tag_id) VALUES ($1, $2)`,
-        [id, tagId]
+        `INSERT INTO try_league_event_tags (session_id, group_idx, tag_id) VALUES ($1, $2, $3)`,
+        [id, gi, tagId]
       );
     }
     const result = await client.query(
       `SELECT et.id, et.name, et.is_active
        FROM try_league_event_tags tlet
        JOIN event_tags et ON et.id = tlet.tag_id
-       WHERE tlet.event_id = $1
+       WHERE tlet.session_id = $1 AND tlet.group_idx = $2
        ORDER BY et.name ASC`,
-      [id]
+      [id, gi]
     );
     await client.query('COMMIT');
-    res.json({ tags: result.rows });
+    res.json({ group_idx: gi, tags: result.rows });
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
@@ -5106,6 +5121,15 @@ function computeTryLeagueMatchDeltas(matchRows) {
 // to a config column on event_tags if a hall actually asks for them. Divergent
 // per-event config (e.g. different group sizes under one tag) is not flagged in
 // this version — also deferred per the doc.
+// KNOWN GAP (2026-09-19): try_league_event_tags is now group-scoped
+// (session_id, group_idx, tag_id) — see context_tl_group_tags_scope.md — but this
+// route still aggregates at the whole-SESSION level (a session is "in scope" if
+// ANY of its groups carries a matching tag, then every match in the whole session
+// counts). Restructuring this to aggregate by (session_id, group_idx) pairs, and
+// to filter matches down to just the tagged group, is scope doc step 5 — not done
+// in this pass. Left as-is (querying tlet.session_id with no group_idx filter) so
+// the route keeps working after the event_id → session_id rename rather than being
+// broken outright; it is over-inclusive versus the eventual per-group behavior.
 // A player's stats are always ONE row, never split per tag — tags are informational
 // (see each player's `tags` array below), not a partition key. If tag_ids IS given,
 // every session in scope carries at least one of them (OR, not AND — the motivating
@@ -5165,7 +5189,7 @@ app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (re
         ? `SELECT DISTINCT s.session_id, s.name, s.status, s.started_at, s.created_at,
                   COALESCE(s.started_at, s.created_at) AS sort_key
            FROM tryleague_sessions s
-           JOIN try_league_event_tags tlet ON tlet.event_id = s.session_id
+           JOIN try_league_event_tags tlet ON tlet.session_id = s.session_id
            WHERE tlet.tag_id = ANY($1::int[]) AND s.poolhall_id = $2 ${dateClause}
            ORDER BY sort_key ASC`
         : `SELECT s.session_id, s.name, s.status, s.started_at, s.created_at
@@ -5194,10 +5218,10 @@ app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (re
     // `tags` badge list below. Independent of whether this request was itself
     // tag_id-filtered (a session can carry more than one tag).
     const sessionTagsResult = await pool.query(
-      `SELECT tlet.event_id AS session_id, et.id, et.name
+      `SELECT tlet.session_id, et.id, et.name
        FROM try_league_event_tags tlet
        JOIN event_tags et ON et.id = tlet.tag_id
-       WHERE tlet.event_id = ANY($1::int[])`,
+       WHERE tlet.session_id = ANY($1::int[])`,
       [sessionIds]
     );
     const tagsBySession = new Map();
