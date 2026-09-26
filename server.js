@@ -5481,6 +5481,349 @@ app.get('/public/poolhalls/:publicId/rr-player-stats', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ── GET /public/poolhalls/:publicId/event-tags ────────────────────────────────
+// No auth. Lists this hall's ACTIVE event tags, for the tag-filter dropdown on
+// the public lifetime-stats pages (reports/rr-players.html, reports/tl-players.html).
+// Archived tags are left out — there's no "show archived" toggle on a public
+// page the way halladmin/tags.html has one, and a tag the hall retired
+// shouldn't keep appearing here. Added 2026-09-26 alongside rr-tag-stats and
+// tl-tag-stats below (Chris asked for tag filtering on both QR-linked stats
+// pages, RR first with TL to match).
+app.get('/public/poolhalls/:publicId/event-tags', async (req, res) => {
+  const { publicId } = req.params;
+  try {
+    const hallResult = await pool.query(
+      `SELECT poolhall_id FROM poolhall WHERE public_id = $1`,
+      [publicId]
+    );
+    if (hallResult.rows.length === 0) return res.status(404).json({ error: 'Hall not found' });
+    const { poolhall_id } = hallResult.rows[0];
+
+    const result = await pool.query(
+      `SELECT id, name FROM event_tags WHERE poolhall_id = $1 AND is_active = true ORDER BY name ASC`,
+      [poolhall_id]
+    );
+    res.json({ tags: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /public/poolhalls/:publicId/rr-tag-stats ──────────────────────────────
+// No auth. Public, tag-filtered counterpart to rr-player-stats above, for
+// reports/rr-players.html's tag filter. Same live-query, group-scoped
+// aggregation as the authenticated /hall/roundrobin-tag-standings (see that
+// route's comment for the full design rationale: OR-not-AND across selected
+// tags, computeRoundRobinStandings() run once per in-scope tournament so its
+// bye/handicap/make-up dedup logic stays correct, one row per player with a
+// `tags` badge list). Kept as its own route rather than reusing the
+// hall-admin one directly so that route's auth model stays untouched.
+// tag_ids is REQUIRED here (unlike the hall-admin version) — the public page
+// already has the unfiltered lifetime view from rr-player-stats above (reads
+// the cached roundrobin_player_stats table, cheaper), so this route only
+// runs for an actual tag selection. Placement/shared_placement aren't
+// computed here — the public page ranks by row order (1., 2., 3.…) via its
+// own sort, same as it does today for the unfiltered view.
+app.get('/public/poolhalls/:publicId/rr-tag-stats', async (req, res) => {
+  const { publicId } = req.params;
+  let tagIds = [];
+  if (req.query.tag_ids) {
+    tagIds = String(req.query.tag_ids).split(',').map(s => parseInt(s, 10)).filter(n => !isNaN(n));
+  }
+  if (!tagIds.length) return res.status(400).json({ error: 'tag_ids is required' });
+
+  try {
+    const hallResult = await pool.query(
+      `SELECT poolhall_id, poolhall_name FROM poolhall WHERE public_id = $1`,
+      [publicId]
+    );
+    if (hallResult.rows.length === 0) return res.status(404).json({ error: 'Hall not found' });
+    const { poolhall_id: poolhallId, poolhall_name } = hallResult.rows[0];
+
+    const tagResult = await pool.query(
+      `SELECT id, name, is_active FROM event_tags WHERE id = ANY($1::int[]) AND poolhall_id = $2 AND is_active = true`,
+      [tagIds, poolhallId]
+    );
+    const tags = tagResult.rows;
+    if (tags.length === 0) return res.status(404).json({ error: 'No matching tags found' });
+    tagIds = tags.map(t => t.id);
+
+    // scopePairs: tournament_id -> Set<group_idx> to include (only groups that
+    // actually carry one of the selected tags — unlike the hall-admin route,
+    // there's no "no tags selected" case here since tag_ids is required).
+    const scopePairs = new Map();
+    const pairsResult = await pool.query(
+      `SELECT rret.tournament_id, rret.group_idx
+         FROM round_robin_event_tags rret
+         JOIN roundrobin_tournaments rt ON rt.tournament_id = rret.tournament_id
+        WHERE rret.tag_id = ANY($1::int[]) AND rt.poolhall_id = $2`,
+      [tagIds, poolhallId]
+    );
+    for (const r of pairsResult.rows) {
+      if (!scopePairs.has(r.tournament_id)) scopePairs.set(r.tournament_id, new Set());
+      scopePairs.get(r.tournament_id).add(r.group_idx);
+    }
+
+    if (scopePairs.size === 0) {
+      return res.json({ poolhall_name, tags, tournament_count: 0, players: [] });
+    }
+
+    const tournamentIds = [...scopePairs.keys()];
+
+    // Every tag attached to every in-scope group — powers each player's
+    // `tags` badge list below, same as the hall-admin route.
+    const groupTagsResult = await pool.query(
+      `SELECT rret.tournament_id, rret.group_idx, et.id, et.name
+         FROM round_robin_event_tags rret
+         JOIN event_tags et ON et.id = rret.tag_id
+        WHERE rret.tournament_id = ANY($1::int[])`,
+      [tournamentIds]
+    );
+    const tagsByPair = new Map(); // "tournamentId:groupIdx" -> [{id,name}]
+    for (const r of groupTagsResult.rows) {
+      const key = `${r.tournament_id}:${r.group_idx}`;
+      if (!tagsByPair.has(key)) tagsByPair.set(key, []);
+      tagsByPair.get(key).push({ id: r.id, name: r.name });
+    }
+
+    const agg = new Map(); // player_id -> running totals
+    const ensureAgg = (id) => {
+      if (!agg.has(id)) {
+        agg.set(id, {
+          first_name: '', last_name: '', hall_rating: null,
+          wins: 0, losses: 0, byes: 0, ball_points: 0, handicap_bonus: 0,
+          tournamentIds: new Set(), tagIds: new Set(), tags: []
+        });
+      }
+    };
+
+    for (const tournamentId of tournamentIds) {
+      const groupScope = scopePairs.get(tournamentId);
+
+      const tRes = await pool.query(
+        `SELECT tournament_id, config FROM roundrobin_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`,
+        [tournamentId, poolhallId]
+      );
+      if (tRes.rows.length === 0) continue;
+      const config = tRes.rows[0].config || {};
+
+      const pRes = await pool.query(
+        `SELECT rtp.player_id, rtp.group_idx, rtp.seed_rating, p.first_name, p.last_name, p.hall_rating
+           FROM roundrobin_tournament_players rtp
+           JOIN player p ON p.player_id = rtp.player_id
+          WHERE rtp.tournament_id = $1`,
+        [tournamentId]
+      );
+      const mRes = await pool.query(
+        `SELECT match_id, group_idx, round_num, match_num, p1_id, p2_id,
+                score1, score2, winner_id, is_bye, is_makeup, status
+           FROM roundrobin_matches
+          WHERE tournament_id = $1
+          ORDER BY group_idx, round_num, match_id`,
+        [tournamentId]
+      );
+
+      const { groups } = computeRoundRobinStandings(config, pRes.rows, mRes.rows);
+
+      for (const g of groups) {
+        if (!groupScope.has(g.group_idx)) continue;
+        const groupTagList = tagsByPair.get(`${tournamentId}:${g.group_idx}`) || [];
+        for (const p of g.players) {
+          ensureAgg(p.player_id);
+          const a = agg.get(p.player_id);
+          a.first_name     = p.first_name;
+          a.last_name      = p.last_name;
+          a.hall_rating    = p.hall_rating;
+          a.wins           += p.wins;
+          a.losses         += p.losses;
+          a.byes           += p.byes;
+          a.ball_points    += p.ball_points;
+          a.handicap_bonus += p.handicap_bonus;
+          a.tournamentIds.add(tournamentId);
+          for (const t of groupTagList) {
+            if (!a.tagIds.has(t.id)) { a.tagIds.add(t.id); a.tags.push(t); }
+          }
+        }
+      }
+    }
+
+    if (agg.size === 0) {
+      return res.json({ poolhall_name, tags, tournament_count: scopePairs.size, players: [] });
+    }
+
+    const players = [...agg.entries()].map(([player_id, a]) => {
+      const handicap_bonus = Math.round(a.handicap_bonus * 100) / 100;
+      const total_points   = Math.round((a.wins + handicap_bonus) * 100) / 100;
+      return {
+        player_id,
+        first_name: a.first_name || '',
+        last_name: a.last_name || '',
+        hall_rating: a.hall_rating != null ? Number(a.hall_rating) : null,
+        tournaments_played: a.tournamentIds.size,
+        wins: a.wins,
+        losses: a.losses,
+        byes: a.byes,
+        ball_points: a.ball_points,
+        handicap_bonus,
+        total_points,
+        tags: a.tags.sort((x, y) => x.name.localeCompare(y.name))
+      };
+    }).sort((x, y) => (y.total_points - x.total_points) || (y.ball_points - x.ball_points));
+
+    res.json({ poolhall_name, tags, tournament_count: scopePairs.size, players });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /public/poolhalls/:publicId/tl-tag-stats ──────────────────────────────
+// No auth. Public, tag-filtered counterpart to tl-player-stats above, for
+// reports/tl-players.html's tag filter. Same live-query aggregation as the
+// authenticated /hall/tryleague-tag-standings (see that route's comment for
+// the full design rationale, including the KNOWN GAP it flags: tags are
+// group-scoped but that route — and this one, inheriting the same query —
+// aggregates at the whole-SESSION level; a session counts if ANY of its
+// groups carries a matching tag, then every match in the session counts.
+// Restructuring to per-group is tracked there, not duplicated here).
+// tag_ids is REQUIRED (unlike the hall-admin version, which also supports an
+// unfiltered/date-ranged view this public page doesn't need) — the
+// unfiltered lifetime view already exists via tl-player-stats above (cached
+// tryleague_player_stats table, cheaper), so this route only runs for an
+// actual tag selection. No from/to date filtering — not needed here.
+app.get('/public/poolhalls/:publicId/tl-tag-stats', async (req, res) => {
+  const { publicId } = req.params;
+  let tagIds = [];
+  if (req.query.tag_ids) {
+    tagIds = String(req.query.tag_ids).split(',').map(s => parseInt(s, 10)).filter(n => !isNaN(n));
+  }
+  if (!tagIds.length) return res.status(400).json({ error: 'tag_ids is required' });
+
+  try {
+    const hallResult = await pool.query(
+      `SELECT poolhall_id, poolhall_name FROM poolhall WHERE public_id = $1`,
+      [publicId]
+    );
+    if (hallResult.rows.length === 0) return res.status(404).json({ error: 'Hall not found' });
+    const { poolhall_id: poolhallId, poolhall_name } = hallResult.rows[0];
+
+    const tagResult = await pool.query(
+      `SELECT id, name, is_active FROM event_tags WHERE id = ANY($1::int[]) AND poolhall_id = $2 AND is_active = true`,
+      [tagIds, poolhallId]
+    );
+    const tags = tagResult.rows;
+    if (tags.length === 0) return res.status(404).json({ error: 'No matching tags found' });
+    tagIds = tags.map(t => t.id);
+
+    const sessionsResult = await pool.query(
+      `SELECT DISTINCT s.session_id, s.name, s.status, s.started_at, s.created_at,
+              COALESCE(s.started_at, s.created_at) AS sort_key
+         FROM tryleague_sessions s
+         JOIN try_league_event_tags tlet ON tlet.session_id = s.session_id
+        WHERE tlet.tag_id = ANY($1::int[]) AND s.poolhall_id = $2
+        ORDER BY sort_key ASC`,
+      [tagIds, poolhallId]
+    );
+    const sessions = sessionsResult.rows;
+    if (sessions.length === 0) {
+      return res.json({ poolhall_name, tags, sessions: [], players: [] });
+    }
+    const sessionIds = sessions.map(s => s.session_id);
+
+    const matchesResult = await pool.query(
+      `SELECT session_id, p1_id, p2_id, winner_id, is_rotate, score1, score2
+       FROM tryleague_matches
+       WHERE session_id = ANY($1::int[]) AND status = 'done' AND winner_id IS NOT NULL AND score1 IS NOT NULL`,
+      [sessionIds]
+    );
+    const rosterResult = await pool.query(
+      `SELECT session_id, player_id FROM tryleague_session_players WHERE session_id = ANY($1::int[])`,
+      [sessionIds]
+    );
+    const sessionTagsResult = await pool.query(
+      `SELECT tlet.session_id, et.id, et.name
+       FROM try_league_event_tags tlet
+       JOIN event_tags et ON et.id = tlet.tag_id
+       WHERE tlet.session_id = ANY($1::int[])`,
+      [sessionIds]
+    );
+    const tagsBySession = new Map();
+    for (const t of sessionTagsResult.rows) {
+      if (!tagsBySession.has(t.session_id)) tagsBySession.set(t.session_id, []);
+      tagsBySession.get(t.session_id).push({ id: t.id, name: t.name });
+    }
+
+    const matchesBySession = new Map();
+    for (const m of matchesResult.rows) {
+      if (!matchesBySession.has(m.session_id)) matchesBySession.set(m.session_id, []);
+      matchesBySession.get(m.session_id).push(m);
+    }
+
+    const agg = new Map();
+    const ensureAgg = (id) => {
+      if (!agg.has(id)) agg.set(id, { wins: 0, losses: 0, points: 0, sessions_played: 0, tagIds: new Set(), tags: [] });
+    };
+
+    for (const sessionId of sessionIds) {
+      const sessionMatches = matchesBySession.get(sessionId) || [];
+      const deltas = computeTryLeagueMatchDeltas(sessionMatches);
+      for (const [playerId, d] of deltas.entries()) {
+        ensureAgg(playerId);
+        const a = agg.get(playerId);
+        a.wins   += d.wins;
+        a.losses += d.losses;
+        a.points += d.points;
+      }
+    }
+    for (const r of rosterResult.rows) {
+      ensureAgg(r.player_id);
+      const a = agg.get(r.player_id);
+      a.sessions_played += 1;
+      for (const t of (tagsBySession.get(r.session_id) || [])) {
+        if (!a.tagIds.has(t.id)) { a.tagIds.add(t.id); a.tags.push(t); }
+      }
+    }
+
+    if (agg.size === 0) {
+      return res.json({ poolhall_name, tags, sessions: sessions.map(s => ({ session_id: s.session_id, name: s.name, status: s.status })), players: [] });
+    }
+
+    const playerIds = [...agg.keys()];
+    const playersResult = await pool.query(
+      `SELECT player_id, first_name, last_name, hall_rating, tier
+       FROM player WHERE player_id = ANY($1::int[])`,
+      [playerIds]
+    );
+    const playerInfo = new Map(playersResult.rows.map(p => [p.player_id, p]));
+
+    const players = playerIds.map(playerId => {
+      const info  = playerInfo.get(playerId) || {};
+      const stats = agg.get(playerId);
+      return {
+        player_id: playerId,
+        first_name: info.first_name || '',
+        last_name: info.last_name || '',
+        hall_rating: info.hall_rating || null,
+        tier: info.tier || null,
+        sessions_played: stats.sessions_played,
+        total_wins: stats.wins,
+        total_losses: stats.losses,
+        total_points: stats.points,
+        tags: stats.tags.sort((a, b) => a.name.localeCompare(b.name))
+      };
+    }).sort((a, b) => b.total_wins - a.total_wins);
+
+    res.json({
+      poolhall_name,
+      tags,
+      sessions: sessions.map(s => ({ session_id: s.session_id, name: s.name, status: s.status })),
+      players
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Walks from league.start_date to league.end_date, collecting dates matching
 // playing_day, minus any in skip_dates. Used by both POST /generate-schedule
 // (random leagues, pre-activation) and POST /activate (league_nights creation,
