@@ -1942,6 +1942,24 @@ app.post('/hall/roundrobin-tournaments/:id/schedule', requireAuth, requireHallAd
       }
     }
 
+    // Refresh the rating snapshot (2026-09-29): a rating corrected after registration
+    // otherwise leaves seed_rating stale, so groups, odd-man-out, handicaps and Standings
+    // would keep using the old number. Re-seed from the player's current hall_rating
+    // BEFORE anything below reads seed_rating. Players with no hall_rating keep their
+    // existing snapshot. Note this re-scores any already-scored games retroactively
+    // (handicap is computed live from seed_rating), same as regenerating already does
+    // to the schedule itself.
+    await pool.query(
+      `UPDATE roundrobin_tournament_players rtp
+          SET seed_rating = p.hall_rating
+         FROM player p
+        WHERE p.player_id = rtp.player_id
+          AND rtp.tournament_id = $1
+          AND p.hall_rating IS NOT NULL
+          AND rtp.seed_rating IS DISTINCT FROM p.hall_rating`,
+      [id]
+    );
+
     // Load registered players ordered by seed_rating desc
     const pResult = await pool.query(
       `SELECT rtp.player_id, rtp.seed_rating
@@ -2273,9 +2291,11 @@ app.post('/hall/roundrobin-tournaments/:id/schedule', requireAuth, requireHallAd
       `SELECT m.match_id, m.group_idx, m.round_num, m.match_num,
               m.p1_id, m.p2_id, m.is_bye, m.is_makeup, m.status,
               p1.first_name AS p1_first, p1.last_name AS p1_last,
-              p1.hall_rating AS p1_rating,
+              (SELECT t.seed_rating FROM roundrobin_tournament_players t
+                WHERE t.tournament_id = m.tournament_id AND t.player_id = m.p1_id) AS p1_rating,
               p2.first_name AS p2_first, p2.last_name AS p2_last,
-              p2.hall_rating AS p2_rating
+              (SELECT t.seed_rating FROM roundrobin_tournament_players t
+                WHERE t.tournament_id = m.tournament_id AND t.player_id = m.p2_id) AS p2_rating
        FROM roundrobin_matches m
        JOIN player p1 ON m.p1_id = p1.player_id
        LEFT JOIN player p2 ON m.p2_id = p2.player_id
@@ -2307,9 +2327,11 @@ app.get('/hall/roundrobin-tournaments/:id/matches', requireAuth, requireHallAuth
       `SELECT m.match_id, m.group_idx, m.round_num, m.match_num,
               m.p1_id, m.p2_id, m.is_bye, m.is_makeup, m.status, m.winner_id, m.score1, m.score2,
               p1.first_name AS p1_first, p1.last_name AS p1_last,
-              p1.hall_rating AS p1_rating,
+              (SELECT t.seed_rating FROM roundrobin_tournament_players t
+                WHERE t.tournament_id = m.tournament_id AND t.player_id = m.p1_id) AS p1_rating,
               p2.first_name AS p2_first, p2.last_name AS p2_last,
-              p2.hall_rating AS p2_rating
+              (SELECT t.seed_rating FROM roundrobin_tournament_players t
+                WHERE t.tournament_id = m.tournament_id AND t.player_id = m.p2_id) AS p2_rating
        FROM roundrobin_matches m
        JOIN player p1 ON m.p1_id = p1.player_id
        LEFT JOIN player p2 ON m.p2_id = p2.player_id
