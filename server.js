@@ -1091,7 +1091,13 @@ app.post('/hall/chip-tournaments', requireAuth, requireHallAdmin, async (req, re
        RETURNING tournament_id, poolhall_id, name, status, config, fargo_config, created_at`,
       [req.hallId, name || null, JSON.stringify(config), fargo_config ? JSON.stringify(fargo_config) : null]
     );
-    res.status(201).json({ tournament: result.rows[0] });
+    const tournament = result.rows[0];
+    // Event audit log (chip wiring, 2026-10-04) -- same shape as Round Robin's create.
+    await logEventAudit(pool, {
+      poolhallId: req.hallId, eventType: 'chip_tournament', eventId: tournament.tournament_id,
+      action: 'created', req, snapshot: tournament
+    });
+    res.status(201).json({ tournament });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1144,6 +1150,18 @@ app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req,
         );
       }
     }
+    // Event audit log (chip wiring, 2026-10-04). Mirrors Round Robin's PUT: only when the status
+    // actually changes (a config-only save such as Save Payouts logs nothing), and a transition INTO
+    // 'finished' emits 'finished' rather than 'status_change' so completion reads the same across
+    // modules. Logged on the transaction client so it commits atomically with the change itself;
+    // logEventAudit's SAVEPOINT keeps a rejected audit write from rolling the real work back.
+    if (status && status !== row.status) {
+      await logEventAudit(client, {
+        poolhallId: req.hallId, eventType: 'chip_tournament', eventId: id,
+        action: isNewFinish ? 'finished' : 'status_change', req, snapshot: result.rows[0],
+        detail: { old_status: row.status, new_status: status }
+      });
+    }
     await client.query('COMMIT');
     res.json({ tournament: result.rows[0] });
   } catch (err) {
@@ -1157,11 +1175,41 @@ app.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req,
 app.delete('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (req, res) => {
   const { id } = req.params;
   try {
+    // Event audit log (chip wiring, 2026-10-04): snapshot the tournament + capture counts and roster
+    // BEFORE the delete cascades them away -- the only chance to record what was lost. Same pattern as
+    // the Round Robin and Try League deletes. Reset on an unfinished tournament lands here.
+    const existing = await pool.query(
+      `SELECT tournament_id, poolhall_id, name, status, config, fargo_config, created_at, started_at, finished_at
+       FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`, [id, req.hallId]
+    );
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    const snapshot = existing.rows[0];
+    const counts = await pool.query(
+      `SELECT
+         (SELECT COUNT(*) FROM chip_tournament_players WHERE tournament_id = $1) AS player_count,
+         (SELECT COUNT(*) FROM chip_matches WHERE tournament_id = $1) AS match_count,
+         (SELECT COUNT(*) FROM chip_matches WHERE tournament_id = $1 AND status = 'done') AS matches_done`, [id]
+    );
+    const roster = await pool.query(
+      `SELECT p.first_name, p.last_name
+       FROM chip_tournament_players ctp JOIN player p ON p.player_id = ctp.player_id
+       WHERE ctp.tournament_id = $1 ORDER BY ctp.id ASC`, [id]
+    );
     const result = await pool.query(
       `DELETE FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2
        RETURNING tournament_id, name, status`, [id, req.hallId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    await logEventAudit(pool, {
+      poolhallId: req.hallId, eventType: 'chip_tournament', eventId: id, action: 'deleted', req,
+      snapshot,
+      detail: {
+        player_count: parseInt(counts.rows[0].player_count, 10),
+        match_count:  parseInt(counts.rows[0].match_count, 10),
+        matches_done: parseInt(counts.rows[0].matches_done, 10),
+        roster: roster.rows.map(r => `${r.first_name} ${r.last_name}`)
+      }
+    });
     res.json({ message: 'Tournament deleted', tournament: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
