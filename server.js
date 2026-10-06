@@ -1071,7 +1071,7 @@ app.get('/hall/chip-tournaments', requireAuth, requireHallAuth, async (req, res)
   try {
     const result = await pool.query(
       `SELECT tournament_id, poolhall_id, name, status, config, fargo_config,
-              created_at, started_at, finished_at
+              public_id, created_at, started_at, finished_at
        FROM chip_tournaments WHERE poolhall_id = $1 ORDER BY created_at DESC`,
       [req.hallId]
     );
@@ -1088,7 +1088,7 @@ app.post('/hall/chip-tournaments', requireAuth, requireHallAdmin, async (req, re
     const result = await pool.query(
       `INSERT INTO chip_tournaments (poolhall_id, name, status, config, fargo_config, created_at)
        VALUES ($1, $2, 'setup', $3, $4, NOW())
-       RETURNING tournament_id, poolhall_id, name, status, config, fargo_config, created_at`,
+       RETURNING tournament_id, poolhall_id, name, status, config, fargo_config, public_id, created_at`,
       [req.hallId, name || null, JSON.stringify(config), fargo_config ? JSON.stringify(fargo_config) : null]
     );
     const tournament = result.rows[0];
@@ -1220,7 +1220,7 @@ app.get('/hall/chip-tournaments/:id', requireAuth, requireHallAuth, async (req, 
   const { id } = req.params;
   try {
     const result = await pool.query(
-      `SELECT tournament_id, poolhall_id, name, status, config, fargo_config, created_at, started_at, finished_at
+      `SELECT tournament_id, poolhall_id, name, status, config, fargo_config, public_id, created_at, started_at, finished_at
        FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`, [id, req.hallId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
@@ -5547,6 +5547,122 @@ app.get('/public/poolhalls/:publicId/rr-player-stats', async (req, res) => {
       poolhall_name,
       players: result.rows
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /public/chip-tournaments/:publicId ───────────────────────────────────
+// Chip Tournament public report (reports/chip.html), added 2026-10-06. No auth.
+// Looked up by public_id (opaque 12-char token, same pattern as
+// roundrobin_tournaments.public_id) — never the sequential tournament_id.
+// Only 'running' or 'finished' tournaments are exposed; a 'setup' tournament has
+// no draw yet. Read-only; returns raw rows and the page ranks them (same
+// ordering the admin page uses: active players by chips then wins, eliminated
+// players by finish_position).
+//
+// Deliberately NOT returned: payout amounts, entry fee/config, fargo_config and
+// player contact/rating fields beyond names — a spectator page has no need of
+// money or ratings. In a FINISHED tournament, matches still 'playing' were
+// voided by Finish (chip_matches.status has no 'void' value); they are reported
+// here as status 'void' so the page can show "not played".
+app.get('/public/chip-tournaments/:publicId', async (req, res) => {
+  const { publicId } = req.params;
+  try {
+    const tRes = await pool.query(
+      `SELECT ct.tournament_id, ct.name, ct.status, ct.created_at, ct.started_at, ct.finished_at,
+              ph.poolhall_name
+         FROM chip_tournaments ct
+         JOIN poolhall ph ON ph.poolhall_id = ct.poolhall_id
+        WHERE ct.public_id = $1 AND ct.status IN ('running', 'finished')`,
+      [publicId]
+    );
+    if (tRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Tournament not found or not yet started' });
+    }
+    const t = tRes.rows[0];
+
+    const pRes = await pool.query(
+      `SELECT ctp.player_id, ctp.starting_chips, ctp.current_chips, ctp.finish_position,
+              ctp.rebuys, ctp.wins, ctp.losses, ctp.status,
+              p.first_name, p.last_name
+         FROM chip_tournament_players ctp
+         JOIN player p ON p.player_id = ctp.player_id
+        WHERE ctp.tournament_id = $1
+        ORDER BY ctp.id ASC`,
+      [t.tournament_id]
+    );
+
+    const mRes = await pool.query(
+      `SELECT match_id, round_seq, table_number, p1_id, p2_id, winner_id, loser_id, status, finished_at
+         FROM chip_matches
+        WHERE tournament_id = $1
+        ORDER BY match_id ASC`,
+      [t.tournament_id]
+    );
+    const matches = mRes.rows.map(m =>
+      (t.status === 'finished' && m.status === 'playing') ? { ...m, status: 'void' } : m
+    );
+
+    res.json({
+      tournament: {
+        name: t.name, status: t.status,
+        created_at: t.created_at, started_at: t.started_at, finished_at: t.finished_at
+      },
+      poolhall_name: t.poolhall_name,
+      players: pRes.rows,
+      matches
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /public/poolhalls/:publicId/chip-player-stats ─────────────────────────
+// Lifetime Chip Tournament stats (reports/chip-players.html), added 2026-10-06.
+// No auth; same shape as rr-player-stats / tl-player-stats. Source is
+// chip_player_stats (one lifetime row per player, written by the finish
+// transition), plus a 'titles' count (finished tournaments won — finish_position
+// 1, split winners each count) computed live. Earnings are NOT exposed publicly.
+// No tag filtering yet: chip has no event tags, and chip_player_stats cannot be
+// tag-filtered anyway (see context_chip_tournament.md section C.3).
+app.get('/public/poolhalls/:publicId/chip-player-stats', async (req, res) => {
+  const { publicId } = req.params;
+  try {
+    const hallResult = await pool.query(
+      `SELECT poolhall_id, poolhall_name FROM poolhall WHERE public_id = $1`,
+      [publicId]
+    );
+    if (hallResult.rows.length === 0) return res.status(404).json({ error: 'Hall not found' });
+    const { poolhall_id, poolhall_name } = hallResult.rows[0];
+
+    const result = await pool.query(
+      `SELECT
+         p.player_id,
+         p.first_name,
+         p.last_name,
+         COALESCE(s.tournaments_played, 0) AS tournaments_played,
+         COALESCE(s.total_wins,   0)       AS total_wins,
+         COALESCE(s.total_losses, 0)       AS total_losses,
+         COALESCE(s.total_rebuys, 0)       AS total_rebuys,
+         (SELECT COUNT(*)::int
+            FROM chip_tournament_players ctp
+            JOIN chip_tournaments ct ON ct.tournament_id = ctp.tournament_id
+           WHERE ctp.player_id = p.player_id
+             AND ct.poolhall_id = $1
+             AND ct.status = 'finished'
+             AND ctp.finish_position = 1) AS titles,
+         s.last_played_at
+       FROM player p
+       JOIN chip_player_stats s
+         ON s.player_id = p.player_id AND s.poolhall_id = $1
+       WHERE p.poolhall_id = $1
+         AND p.deleted_at IS NULL
+       ORDER BY s.total_wins DESC, p.last_name, p.first_name`,
+      [poolhall_id]
+    );
+
+    res.json({ poolhall_name, players: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
