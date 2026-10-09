@@ -1070,9 +1070,12 @@ app.put('/hall/event-tags/:id', requireAuth, requireHallAdmin, async (req, res) 
 app.get('/hall/chip-tournaments', requireAuth, requireHallAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT tournament_id, poolhall_id, name, status, config, fargo_config,
-              public_id, created_at, started_at, finished_at
-       FROM chip_tournaments WHERE poolhall_id = $1 ORDER BY created_at DESC`,
+      `SELECT ct.tournament_id, ct.poolhall_id, ct.name, ct.status, ct.config, ct.fargo_config,
+              ct.public_id, ct.created_at, ct.started_at, ct.finished_at,
+              COALESCE((SELECT json_agg(json_build_object('id', et.id, 'name', et.name, 'is_active', et.is_active) ORDER BY et.name)
+                          FROM chip_event_tags cet JOIN event_tags et ON et.id = cet.tag_id
+                         WHERE cet.tournament_id = ct.tournament_id), '[]'::json) AS tags
+       FROM chip_tournaments ct WHERE ct.poolhall_id = $1 ORDER BY ct.created_at DESC`,
       [req.hallId]
     );
     res.json({ tournaments: result.rows });
@@ -1225,6 +1228,171 @@ app.get('/hall/chip-tournaments/:id', requireAuth, requireHallAuth, async (req, 
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
     res.json({ tournament: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Chip Tournament event tags (added 2026-10-09) ───────────────────────────
+// Event-scoped, Try League style: a chip tournament is ONE event per night (no groups), so the join
+// table is chip_event_tags (tournament_id, tag_id) -- never per-group, never per-player. Uses the shared
+// hall-scoped event_tags pool. No status restriction: tags can be set or changed at any point, including
+// after Finish (retroactive edit from the Standings view / Historical tab). Not audit-logged.
+app.get('/hall/chip-tournaments/:id/tags', requireAuth, requireHallAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const own = await pool.query(
+      `SELECT tournament_id FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`, [id, req.hallId]
+    );
+    if (own.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
+    const result = await pool.query(
+      `SELECT et.id, et.name, et.is_active
+         FROM chip_event_tags cet JOIN event_tags et ON et.id = cet.tag_id
+        WHERE cet.tournament_id = $1 ORDER BY et.name ASC`, [id]
+    );
+    res.json({ tags: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Full replace -- body: { tag_ids: [...] }. Mirrors the Round Robin group version, one level up.
+app.put('/hall/chip-tournaments/:id/tags', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const tagIds = Array.isArray(req.body.tag_ids) ? req.body.tag_ids.map(n => parseInt(n, 10)) : [];
+  if (tagIds.some(n => !Number.isInteger(n))) return res.status(400).json({ error: 'tag_ids must be integers' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const own = await client.query(
+      `SELECT tournament_id FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`, [id, req.hallId]
+    );
+    if (own.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Tournament not found' });
+    }
+    const uniqueIds = [...new Set(tagIds)];
+    if (uniqueIds.length > 0) {
+      const validTags = await client.query(
+        `SELECT id FROM event_tags WHERE poolhall_id = $1 AND id = ANY($2::int[])`, [req.hallId, uniqueIds]
+      );
+      if (validTags.rows.length !== uniqueIds.length) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'One or more tag_ids are invalid for this hall' });
+      }
+    }
+    await client.query(`DELETE FROM chip_event_tags WHERE tournament_id = $1`, [id]);
+    for (const tagId of uniqueIds) {
+      await client.query(`INSERT INTO chip_event_tags (tournament_id, tag_id) VALUES ($1, $2)`, [id, tagId]);
+    }
+    const result = await client.query(
+      `SELECT et.id, et.name, et.is_active
+         FROM chip_event_tags cet JOIN event_tags et ON et.id = cet.tag_id
+        WHERE cet.tournament_id = $1 ORDER BY et.name ASC`, [id]
+    );
+    await client.query('COMMIT');
+    res.json({ tags: result.rows });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ── GET /hall/chip-tag-standings ──────────────────────────────────────────────
+// Cross-tournament chip standings for halladmin/standings.html (type=chip). Optional ?tag_ids=1,2 (OR across
+// tags, same as the RR/TL routes); no tag_ids = every finished chip tournament at the hall.
+// WHY a live query and not chip_player_stats: that table is one lifetime row per player and cannot be
+// tag-filtered. This aggregates chip_tournament_players over FINISHED tournaments carrying the tag, counting
+// the same players the finish transition counts for lifetime stats (status champion/eliminated).
+// Columns: tournaments_played, titles (finish_position 1 -- split winners each count), wins, losses,
+// earnings (payout; admin-only, never on the public pages), rebuys (0 until re-buys are persisted -- see
+// context_chip_tournament.md). One row per player; a `tags` badge array lists every tag on any in-scope
+// tournament the player was in. Ranked titles, then wins, then earnings.
+app.get('/hall/chip-tag-standings', requireAuth, requireHallAuth, async (req, res) => {
+  let tagIds = [];
+  if (req.query.tag_ids) {
+    tagIds = String(req.query.tag_ids).split(',').map(s => parseInt(s, 10)).filter(n => !isNaN(n));
+  }
+  try {
+    let tags = [];
+    if (tagIds.length) {
+      const tagResult = await pool.query(
+        `SELECT id, name, is_active FROM event_tags WHERE id = ANY($1::int[]) AND poolhall_id = $2`,
+        [tagIds, req.hallId]
+      );
+      tags = tagResult.rows;
+      if (tags.length === 0) return res.status(404).json({ error: 'No matching tags found' });
+      tagIds = tags.map(t => t.id);
+    }
+
+    const tRes = await pool.query(
+      `SELECT ct.tournament_id
+         FROM chip_tournaments ct
+        WHERE ct.poolhall_id = $1 AND ct.status = 'finished'
+          AND ($2::int[] IS NULL OR EXISTS (
+                SELECT 1 FROM chip_event_tags cet WHERE cet.tournament_id = ct.tournament_id AND cet.tag_id = ANY($2::int[])))`,
+      [req.hallId, tagIds.length ? tagIds : null]
+    );
+    const tournamentIds = tRes.rows.map(r => r.tournament_id);
+    if (tournamentIds.length === 0) return res.json({ tags, tournament_count: 0, players: [] });
+
+    const pRes = await pool.query(
+      `SELECT p.player_id, p.first_name, p.last_name, p.hall_rating,
+              COUNT(*)::int AS tournaments_played,
+              COUNT(*) FILTER (WHERE ctp.finish_position = 1)::int AS titles,
+              COALESCE(SUM(ctp.wins), 0)::int   AS wins,
+              COALESCE(SUM(ctp.losses), 0)::int AS losses,
+              COALESCE(SUM(ctp.rebuys), 0)::int AS rebuys,
+              COALESCE(SUM(ctp.payout), 0)::numeric AS earnings
+         FROM chip_tournament_players ctp
+         JOIN player p ON p.player_id = ctp.player_id
+        WHERE ctp.tournament_id = ANY($1::int[]) AND ctp.status IN ('champion', 'eliminated')
+        GROUP BY p.player_id, p.first_name, p.last_name, p.hall_rating`,
+      [tournamentIds]
+    );
+
+    const tagRes = await pool.query(
+      `SELECT DISTINCT ctp.player_id, et.id, et.name
+         FROM chip_tournament_players ctp
+         JOIN chip_event_tags cet ON cet.tournament_id = ctp.tournament_id
+         JOIN event_tags et ON et.id = cet.tag_id
+        WHERE ctp.tournament_id = ANY($1::int[]) AND ctp.status IN ('champion', 'eliminated')`,
+      [tournamentIds]
+    );
+    const tagsByPlayer = new Map();
+    for (const r of tagRes.rows) {
+      if (!tagsByPlayer.has(r.player_id)) tagsByPlayer.set(r.player_id, []);
+      tagsByPlayer.get(r.player_id).push({ id: r.id, name: r.name });
+    }
+
+    const players = pRes.rows.map(r => ({
+      player_id: r.player_id,
+      first_name: r.first_name || '',
+      last_name: r.last_name || '',
+      hall_rating: r.hall_rating != null ? Number(r.hall_rating) : null,
+      tournaments_played: r.tournaments_played,
+      titles: r.titles,
+      wins: r.wins,
+      losses: r.losses,
+      rebuys: r.rebuys,
+      earnings: Math.round(Number(r.earnings) * 100) / 100,
+      tags: (tagsByPlayer.get(r.player_id) || []).sort((a, b) => a.name.localeCompare(b.name))
+    })).sort((a, b) => (b.titles - a.titles) || (b.wins - a.wins) || (b.earnings - a.earnings)
+                       || a.last_name.localeCompare(b.last_name));
+
+    // Standard competition ranking on the same keys the sort uses.
+    let place = 0;
+    players.forEach((p, i) => {
+      const prev = players[i - 1];
+      const tied = prev && prev.titles === p.titles && prev.wins === p.wins && prev.earnings === p.earnings;
+      if (!tied) place = i + 1;
+      p.placement = place;
+    });
+    for (const p of players) p.shared_placement = players.filter(q => q.placement === p.placement).length > 1;
+
+    res.json({ tags, tournament_count: tournamentIds.length, players });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
