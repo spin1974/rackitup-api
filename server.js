@@ -5842,7 +5842,6 @@ app.get('/public/poolhalls/:publicId/chip-player-stats', async (req, res) => {
          COALESCE(s.tournaments_played, 0) AS tournaments_played,
          COALESCE(s.total_wins,   0)       AS total_wins,
          COALESCE(s.total_losses, 0)       AS total_losses,
-         COALESCE(s.total_rebuys, 0)       AS total_rebuys,
          (SELECT COUNT(*)::int
             FROM chip_tournament_players ctp
             JOIN chip_tournaments ct ON ct.tournament_id = ctp.tournament_id
@@ -5861,6 +5860,58 @@ app.get('/public/poolhalls/:publicId/chip-player-stats', async (req, res) => {
     );
 
     res.json({ poolhall_name, players: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /public/poolhalls/:publicId/chip-tag-stats ────────────────────────────
+// No auth. Tag-filtered counterpart to chip-player-stats above, for the dropdown on reports/chip-players.html
+// (added 2026-10-09 with chip event tags). tag_ids REQUIRED (comma-separated), OR across tags, ACTIVE tags only --
+// same rules as rr-tag-stats / tl-tag-stats. Aggregates FINISHED chip tournaments carrying a selected tag, live from
+// chip_tournament_players (chip_player_stats can't be tag-filtered); counts the same players the finish-time stats
+// upsert counts (status champion/eliminated). Row shape matches chip-player-stats so the page renders both with one
+// code path. Earnings are NOT exposed publicly.
+app.get('/public/poolhalls/:publicId/chip-tag-stats', async (req, res) => {
+  const { publicId } = req.params;
+  let tagIds = [];
+  if (req.query.tag_ids) {
+    tagIds = String(req.query.tag_ids).split(',').map(s => parseInt(s, 10)).filter(n => !isNaN(n));
+  }
+  if (!tagIds.length) return res.status(400).json({ error: 'tag_ids is required' });
+  try {
+    const hallResult = await pool.query(
+      `SELECT poolhall_id, poolhall_name FROM poolhall WHERE public_id = $1`, [publicId]
+    );
+    if (hallResult.rows.length === 0) return res.status(404).json({ error: 'Hall not found' });
+    const { poolhall_id: poolhallId, poolhall_name } = hallResult.rows[0];
+
+    const tagResult = await pool.query(
+      `SELECT id, name FROM event_tags WHERE id = ANY($1::int[]) AND poolhall_id = $2 AND is_active = true`,
+      [tagIds, poolhallId]
+    );
+    const tags = tagResult.rows;
+    if (tags.length === 0) return res.status(404).json({ error: 'No matching tags found' });
+    tagIds = tags.map(t => t.id);
+
+    const result = await pool.query(
+      `SELECT p.player_id, p.first_name, p.last_name,
+              COUNT(*)::int AS tournaments_played,
+              COUNT(*) FILTER (WHERE ctp.finish_position = 1)::int AS titles,
+              COALESCE(SUM(ctp.wins), 0)::int   AS total_wins,
+              COALESCE(SUM(ctp.losses), 0)::int AS total_losses
+         FROM chip_tournament_players ctp
+         JOIN chip_tournaments ct ON ct.tournament_id = ctp.tournament_id
+         JOIN player p ON p.player_id = ctp.player_id
+        WHERE ct.poolhall_id = $1 AND ct.status = 'finished'
+          AND ctp.status IN ('champion', 'eliminated')
+          AND p.deleted_at IS NULL
+          AND EXISTS (SELECT 1 FROM chip_event_tags cet WHERE cet.tournament_id = ct.tournament_id AND cet.tag_id = ANY($2::int[]))
+        GROUP BY p.player_id, p.first_name, p.last_name
+        ORDER BY total_wins DESC, p.last_name, p.first_name`,
+      [poolhallId, tagIds]
+    );
+    res.json({ poolhall_name, tags, players: result.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
