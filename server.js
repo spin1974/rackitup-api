@@ -926,12 +926,19 @@ app.get('/hall/players', requireAuth, requireHallAuth, async (req, res) => {
               COALESCE(s.sessions_played,0) AS tl_sessions,
               COALESCE(rr.wins,        0) AS rr_wins,
               COALESCE(rr.losses,      0) AS rr_losses,
-              COALESCE(rr.tournaments, 0) AS rr_tournaments
+              COALESCE(rr.tournaments, 0) AS rr_tournaments,
+              -- Chip lifetime stats (2026-10-09). Like the TL/RR figures above these come from the per-player stats
+              -- tables, which are only written when an event is properly FINISHED -- cancelled/deleted events never count.
+              COALESCE(cs.total_wins,         0) AS chip_wins,
+              COALESCE(cs.total_losses,       0) AS chip_losses,
+              COALESCE(cs.tournaments_played, 0) AS chip_tournaments
        FROM player p
        LEFT JOIN tryleague_player_stats s
          ON s.player_id = p.player_id AND s.poolhall_id = p.poolhall_id
        LEFT JOIN roundrobin_player_stats rr
          ON rr.player_id = p.player_id AND rr.poolhall_id = p.poolhall_id
+       LEFT JOIN chip_player_stats cs
+         ON cs.player_id = p.player_id AND cs.poolhall_id = p.poolhall_id
        WHERE p.poolhall_id = $1 AND p.deleted_at IS NULL
        ORDER BY p.last_name ASC, p.first_name ASC`,
       [req.hallId]
