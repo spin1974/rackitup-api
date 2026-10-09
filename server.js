@@ -1087,22 +1087,45 @@ app.get('/hall/chip-tournaments', requireAuth, requireHallAuth, async (req, res)
 app.post('/hall/chip-tournaments', requireAuth, requireHallAdmin, async (req, res) => {
   const { name, config, fargo_config } = req.body;
   if (!config || typeof config !== 'object') return res.status(400).json({ error: 'config object is required' });
+  // 2026-10-09: optional tag_ids so tags can be chosen at creation. Validated BEFORE anything is inserted, and the
+  // tournament + its tags commit together, so a bad tag id can never leave an untagged tournament behind.
+  const tagIds = Array.isArray(req.body.tag_ids) ? [...new Set(req.body.tag_ids.map(n => parseInt(n, 10)))] : [];
+  if (tagIds.some(n => !Number.isInteger(n))) return res.status(400).json({ error: 'tag_ids must be integers' });
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
+    if (tagIds.length > 0) {
+      const validTags = await client.query(
+        `SELECT id FROM event_tags WHERE poolhall_id = $1 AND id = ANY($2::int[])`, [req.hallId, tagIds]
+      );
+      if (validTags.rows.length !== tagIds.length) return res.status(400).json({ error: 'One or more tag_ids are invalid for this hall' });
+    }
+    await client.query('BEGIN');
+    const result = await client.query(
       `INSERT INTO chip_tournaments (poolhall_id, name, status, config, fargo_config, created_at)
        VALUES ($1, $2, 'setup', $3, $4, NOW())
        RETURNING tournament_id, poolhall_id, name, status, config, fargo_config, public_id, created_at`,
       [req.hallId, name || null, JSON.stringify(config), fargo_config ? JSON.stringify(fargo_config) : null]
     );
     const tournament = result.rows[0];
+    for (const tagId of tagIds) {
+      await client.query(`INSERT INTO chip_event_tags (tournament_id, tag_id) VALUES ($1, $2)`, [tournament.tournament_id, tagId]);
+    }
+    const tagRows = await client.query(
+      `SELECT et.id, et.name, et.is_active FROM chip_event_tags cet JOIN event_tags et ON et.id = cet.tag_id
+        WHERE cet.tournament_id = $1 ORDER BY et.name ASC`, [tournament.tournament_id]
+    );
+    await client.query('COMMIT');
     // Event audit log (chip wiring, 2026-10-04) -- same shape as Round Robin's create.
     await logEventAudit(pool, {
       poolhallId: req.hallId, eventType: 'chip_tournament', eventId: tournament.tournament_id,
       action: 'created', req, snapshot: tournament
     });
-    res.status(201).json({ tournament });
+    res.status(201).json({ tournament, tags: tagRows.rows });
   } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (e) { /* no open transaction */ }
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
