@@ -1569,6 +1569,24 @@ app.delete('/hall/chip-tournaments/:id/matches/:matchId/result', requireAuth, re
   }
 });
 
+// 2026-10-10: remove a match that is still in progress (used when a correction rolls back an already-drawn later round).
+// A played match is reversed with DELETE …/result instead.
+app.delete('/hall/chip-tournaments/:id/matches/:matchId', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id, matchId } = req.params;
+  try {
+    const check = await pool.query(
+      `SELECT cm.match_id, cm.status FROM chip_matches cm JOIN chip_tournaments ct ON ct.tournament_id = cm.tournament_id
+       WHERE cm.match_id = $1 AND cm.tournament_id = $2 AND ct.poolhall_id = $3`, [matchId, id, req.hallId]
+    );
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Match not found' });
+    if (check.rows[0].status !== 'playing') return res.status(409).json({ error: 'Only a match that is still in progress can be removed' });
+    await pool.query(`DELETE FROM chip_matches WHERE match_id = $1 AND tournament_id = $2`, [matchId, id]);
+    res.json({ message: 'Match removed' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.put('/hall/chip-tournaments/:id/matches/:matchId', requireAuth, requireHallAdmin, async (req, res) => {
   const { id, matchId } = req.params;
   const { winner_player_id, loser_player_id, winner_chips, loser_chips, winner_wins, loser_losses, winner_status, loser_status, loser_finish_position } = req.body;
