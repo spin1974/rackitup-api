@@ -2,12 +2,43 @@
 // EXTRACTION ONLY: route bodies are byte-for-byte what was in server.js; the only edit is `app.` -> `router.`
 // on each registration line. Registration order is unchanged (hall routes first, then the public ones).
 // Mounted from server.js with:  app.use(require('./routes/chip'));
+//
+// 2026-10-10 — ONE OFF tournaments (this file is no longer extraction-only from here down; every change is marked "One Off"):
+// A One Off is a casual chip night whose players are guests. Nothing about it is kept: Finish (POST …/finish-one-off) and
+// Delete wipe the tournament, its matches, its roster AND its guest player rows in one transaction. A guest is a real `player`
+// row, born soft-deleted (deleted_at set) and tagged with player.guest_tournament_id, so every existing Players DB list,
+// standings and lifetime-stats query (all filter deleted_at IS NULL) never sees it. A One Off never reaches status 'finished',
+// so chip_player_stats / tag standings / public stats are never written for it — and PUT status 'finished' is refused for one.
 const express = require('express');
 const router  = express.Router();
 
 const pool = require('../db');
 const { requireAuth, requireHallAuth, requireHallAdmin } = require('../middleware/auth');
 const { logEventAudit } = require('../lib/audit');
+
+// One Off: erase a one-off tournament and everything that belongs to it, on `client` (caller owns BEGIN/COMMIT).
+// Order matters: matches and roster rows reference player (no cascade on chip_tournament_players.player_id), so they go
+// first; the guests go last. Returns the counts for the audit row. Throws if the tournament isn't a one-off of this hall.
+async function wipeOneOff(client, tournamentId, hallId) {
+  const own = await client.query(
+    `SELECT tournament_id FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2 AND is_one_off = true FOR UPDATE`,
+    [tournamentId, hallId]
+  );
+  if (own.rows.length === 0) { const e = new Error('One Off tournament not found'); e.status = 404; throw e; }
+  const counts = await client.query(
+    `SELECT (SELECT COUNT(*) FROM chip_tournament_players WHERE tournament_id = $1) AS player_count,
+            (SELECT COUNT(*) FROM chip_matches WHERE tournament_id = $1) AS match_count`, [tournamentId]
+  );
+  await client.query(`DELETE FROM chip_matches WHERE tournament_id = $1`, [tournamentId]);
+  await client.query(`DELETE FROM chip_tournament_players WHERE tournament_id = $1`, [tournamentId]);
+  await client.query(`DELETE FROM chip_event_tags WHERE tournament_id = $1`, [tournamentId]);
+  await client.query(`DELETE FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`, [tournamentId, hallId]);
+  await client.query(`DELETE FROM player WHERE guest_tournament_id = $1 AND poolhall_id = $2`, [tournamentId, hallId]);
+  return {
+    player_count: parseInt(counts.rows[0].player_count, 10),
+    match_count:  parseInt(counts.rows[0].match_count, 10)
+  };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CHIP TOURNAMENT ENDPOINTS
@@ -17,7 +48,7 @@ router.get('/hall/chip-tournaments', requireAuth, requireHallAuth, async (req, r
   try {
     const result = await pool.query(
       `SELECT ct.tournament_id, ct.poolhall_id, ct.name, ct.status, ct.config, ct.fargo_config,
-              ct.public_id, ct.created_at, ct.started_at, ct.finished_at,
+              ct.public_id, ct.is_one_off, ct.created_at, ct.started_at, ct.finished_at,
               COALESCE((SELECT json_agg(json_build_object('id', et.id, 'name', et.name, 'is_active', et.is_active) ORDER BY et.name)
                           FROM chip_event_tags cet JOIN event_tags et ON et.id = cet.tag_id
                          WHERE cet.tournament_id = ct.tournament_id), '[]'::json) AS tags
@@ -37,6 +68,8 @@ router.post('/hall/chip-tournaments', requireAuth, requireHallAdmin, async (req,
   // tournament + its tags commit together, so a bad tag id can never leave an untagged tournament behind.
   const tagIds = Array.isArray(req.body.tag_ids) ? [...new Set(req.body.tag_ids.map(n => parseInt(n, 10)))] : [];
   if (tagIds.some(n => !Number.isInteger(n))) return res.status(400).json({ error: 'tag_ids must be integers' });
+  const isOneOff = req.body.is_one_off === true;                                   // One Off
+  if (isOneOff && tagIds.length > 0) return res.status(400).json({ error: 'A One Off tournament cannot have event tags' });
   const client = await pool.connect();
   try {
     if (tagIds.length > 0) {
@@ -47,10 +80,10 @@ router.post('/hall/chip-tournaments', requireAuth, requireHallAdmin, async (req,
     }
     await client.query('BEGIN');
     const result = await client.query(
-      `INSERT INTO chip_tournaments (poolhall_id, name, status, config, fargo_config, created_at)
-       VALUES ($1, $2, 'setup', $3, $4, NOW())
-       RETURNING tournament_id, poolhall_id, name, status, config, fargo_config, public_id, created_at`,
-      [req.hallId, name || null, JSON.stringify(config), fargo_config ? JSON.stringify(fargo_config) : null]
+      `INSERT INTO chip_tournaments (poolhall_id, name, status, config, fargo_config, is_one_off, created_at)
+       VALUES ($1, $2, 'setup', $3, $4, $5, NOW())
+       RETURNING tournament_id, poolhall_id, name, status, config, fargo_config, public_id, is_one_off, created_at`,
+      [req.hallId, name || null, JSON.stringify(config), fargo_config ? JSON.stringify(fargo_config) : null, isOneOff]
     );
     const tournament = result.rows[0];
     for (const tagId of tagIds) {
@@ -84,11 +117,16 @@ router.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (r
   try {
     await client.query('BEGIN');
     const current = await client.query(
-      `SELECT tournament_id, status, started_at, finished_at FROM chip_tournaments
+      `SELECT tournament_id, status, started_at, finished_at, is_one_off FROM chip_tournaments
        WHERE tournament_id = $1 AND poolhall_id = $2`, [id, req.hallId]
     );
     if (current.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Tournament not found' }); }
     const row = current.rows[0];
+    // One Off: finishing one writes lifetime stats for guests and keeps a record — both forbidden. It has its own route.
+    if (row.is_one_off && status === 'finished') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'A One Off tournament is finished with POST /hall/chip-tournaments/:id/finish-one-off (nothing is saved)' });
+    }
     const isNewFinish = (status === 'finished' && row.status !== 'finished');
     let started_at = row.started_at, finished_at = row.finished_at;
     if (status === 'running' && !started_at) started_at = new Date();
@@ -98,7 +136,7 @@ router.put('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async (r
        config = COALESCE($3, config), fargo_config = COALESCE($4, fargo_config),
        started_at = $5, finished_at = $6
        WHERE tournament_id = $7 AND poolhall_id = $8
-       RETURNING tournament_id, poolhall_id, name, status, config, fargo_config, created_at, started_at, finished_at`,
+       RETURNING tournament_id, poolhall_id, name, status, config, fargo_config, is_one_off, created_at, started_at, finished_at`,
       [name || null, status || null, config ? JSON.stringify(config) : null,
        fargo_config ? JSON.stringify(fargo_config) : null, started_at, finished_at, id, req.hallId]
     );
@@ -151,11 +189,31 @@ router.delete('/hall/chip-tournaments/:id', requireAuth, requireHallAdmin, async
     // BEFORE the delete cascades them away -- the only chance to record what was lost. Same pattern as
     // the Round Robin and Try League deletes. Reset on an unfinished tournament lands here.
     const existing = await pool.query(
-      `SELECT tournament_id, poolhall_id, name, status, config, fargo_config, created_at, started_at, finished_at
+      `SELECT tournament_id, poolhall_id, name, status, config, fargo_config, is_one_off, created_at, started_at, finished_at
        FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`, [id, req.hallId]
     );
     if (existing.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
     const snapshot = existing.rows[0];
+    // One Off: delete = the same wipe as Finish (roster, matches, guest players), atomically, with a bare audit row (no names).
+    if (snapshot.is_one_off) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const wiped = await wipeOneOff(client, id, req.hallId);
+        await logEventAudit(client, {
+          poolhallId: req.hallId, eventType: 'chip_tournament', eventId: id, action: 'deleted', req,
+          snapshot: { tournament_id: snapshot.tournament_id, one_off: true },
+          detail: { one_off: true, ...wiped }
+        });
+        await client.query('COMMIT');
+        return res.json({ message: 'Tournament deleted', tournament: { tournament_id: snapshot.tournament_id, name: snapshot.name, status: snapshot.status } });
+      } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (e) { /* no open transaction */ }
+        return res.status(err.status || 500).json({ error: err.message });
+      } finally {
+        client.release();
+      }
+    }
     const counts = await pool.query(
       `SELECT
          (SELECT COUNT(*) FROM chip_tournament_players WHERE tournament_id = $1) AS player_count,
@@ -192,7 +250,7 @@ router.get('/hall/chip-tournaments/:id', requireAuth, requireHallAuth, async (re
   const { id } = req.params;
   try {
     const result = await pool.query(
-      `SELECT tournament_id, poolhall_id, name, status, config, fargo_config, public_id, created_at, started_at, finished_at
+      `SELECT tournament_id, poolhall_id, name, status, config, fargo_config, public_id, is_one_off, created_at, started_at, finished_at
        FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`, [id, req.hallId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
@@ -405,10 +463,14 @@ router.post('/hall/chip-tournaments/:id/players', requireAuth, requireHallAdmin,
   const { player_id, starting_chips, current_chips } = req.body;
   if (!player_id) return res.status(400).json({ error: 'player_id is required' });
   try {
-    const check = await pool.query(`SELECT tournament_id FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`, [id, req.hallId]);
+    const check = await pool.query(`SELECT tournament_id, is_one_off FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2`, [id, req.hallId]);
     if (check.rows.length === 0) return res.status(404).json({ error: 'Tournament not found' });
-    const pc = await pool.query(`SELECT player_id FROM player WHERE player_id = $1 AND poolhall_id = $2 AND deleted_at IS NULL`, [player_id, req.hallId]);
-    if (pc.rows.length === 0) return res.status(404).json({ error: 'Player not found' });
+    // One Off: only this tournament's own guests can be (re-)added (the mobile chip stepper removes and re-adds a player);
+    // real Players DB players are refused. A normal tournament still needs a live (not soft-deleted) player, which also keeps guests out.
+    const pc = check.rows[0].is_one_off
+      ? await pool.query(`SELECT player_id FROM player WHERE player_id = $1 AND poolhall_id = $2 AND guest_tournament_id = $3`, [player_id, req.hallId, id])
+      : await pool.query(`SELECT player_id FROM player WHERE player_id = $1 AND poolhall_id = $2 AND deleted_at IS NULL`, [player_id, req.hallId]);
+    if (pc.rows.length === 0) return res.status(check.rows[0].is_one_off ? 409 : 404).json({ error: check.rows[0].is_one_off ? 'A One Off tournament takes its own guest players only' : 'Player not found' });
     const result = await pool.query(
       `INSERT INTO chip_tournament_players (tournament_id, player_id, starting_chips, current_chips, status)
        VALUES ($1, $2, $3, $4, 'waiting') ON CONFLICT (tournament_id, player_id) DO NOTHING RETURNING *`,
@@ -454,6 +516,84 @@ router.put('/hall/chip-tournaments/:id/players/:playerId', requireAuth, requireH
     res.json({ player: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── One Off: add a guest ─────────────────────────────────────────────────────
+// Creates the guest `player` row (soft-deleted from birth, tagged with this tournament) AND its roster row in one
+// transaction, and returns both so the page can carry on exactly as if a Players DB player had been added.
+// Body: { first_name, last_name?, hall_rating?, tier?, starting_chips?, current_chips? }.
+router.post('/hall/chip-tournaments/:id/guests', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const first = String(req.body.first_name || '').trim().slice(0, 60);
+  const last  = String(req.body.last_name  || '').trim().slice(0, 60);
+  if (!first) return res.status(400).json({ error: 'first_name is required' });
+  const rating = req.body.hall_rating != null && req.body.hall_rating !== '' ? Number(req.body.hall_rating) : null;
+  if (rating !== null && (!isFinite(rating) || rating < 0 || rating > 10)) return res.status(400).json({ error: 'hall_rating must be a number from 0 to 10' });
+  const tier = req.body.tier ? String(req.body.tier).toUpperCase() : null;
+  if (tier && !['A', 'B', 'C', 'D'].includes(tier)) return res.status(400).json({ error: 'tier must be A, B, C, or D' });
+  const startChips = parseInt(req.body.starting_chips, 10), curChips = parseInt(req.body.current_chips, 10);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const t = await client.query(
+      `SELECT tournament_id, status, is_one_off FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2 FOR UPDATE`, [id, req.hallId]
+    );
+    if (t.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Tournament not found' }); }
+    if (!t.rows[0].is_one_off) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Guests can only be added to a One Off tournament' }); }
+    if (t.rows[0].status === 'finished') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Tournament is finished' }); }
+    const n = await client.query(`SELECT COUNT(*)::int AS n FROM player WHERE guest_tournament_id = $1`, [id]);
+    if (n.rows[0].n >= 100) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'A One Off tournament is limited to 100 guests' }); }
+    const pr = await client.query(
+      `INSERT INTO player (poolhall_id, first_name, last_name, hall_rating, tier, guest_tournament_id, deleted_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       RETURNING player_id, first_name, last_name, hall_rating, tier`,
+      [req.hallId, first, last || null, rating, tier, id]
+    );
+    const guest = pr.rows[0];
+    const cr = await client.query(
+      `INSERT INTO chip_tournament_players (tournament_id, player_id, starting_chips, current_chips, status)
+       VALUES ($1, $2, $3, $4, 'waiting') RETURNING *`,
+      [id, guest.player_id, isFinite(startChips) ? startChips : null, isFinite(curChips) ? curChips : (isFinite(startChips) ? startChips : null)]
+    );
+    await client.query('COMMIT');
+    res.status(201).json({ player: guest, entry: cr.rows[0] });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (e) { /* no open transaction */ }
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ── One Off: Finish = erase ──────────────────────────────────────────────────
+// The page works out the final order itself and shows it on screen; this route then deletes the tournament, its matches,
+// its roster and its guest players in ONE transaction. Only a running One Off can be finished (an unstarted one is just
+// deleted). The audit row is deliberately bare — no names, no results — so nothing identifying outlives the night.
+router.post('/hall/chip-tournaments/:id/finish-one-off', requireAuth, requireHallAdmin, async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const t = await client.query(
+      `SELECT tournament_id, status, is_one_off FROM chip_tournaments WHERE tournament_id = $1 AND poolhall_id = $2 FOR UPDATE`, [id, req.hallId]
+    );
+    if (t.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Tournament not found' }); }
+    if (!t.rows[0].is_one_off) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Not a One Off tournament — finish it the normal way' }); }
+    if (t.rows[0].status !== 'running') { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Only a running One Off tournament can be finished' }); }
+    const wiped = await wipeOneOff(client, id, req.hallId);
+    await logEventAudit(client, {
+      poolhallId: req.hallId, eventType: 'chip_tournament', eventId: id, action: 'finished', req,
+      snapshot: { tournament_id: Number(id), one_off: true },
+      detail: { one_off: true, ...wiped }
+    });
+    await client.query('COMMIT');
+    res.json({ message: 'One Off tournament finished and erased', ...wiped });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (e) { /* no open transaction */ }
+    res.status(err.status || 500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
