@@ -977,6 +977,7 @@ app.put('/hall/event-tags/:id', requireAuth, requireHallAdmin, async (req, res) 
 
 // Chip Tournament routes (hall admin + public) live in routes/chip.js (extracted 2026-10-10).
 app.use(require('./routes/chip'));
+app.use(require('./routes/league-admin'));   // 2026-10-12 — DELETE /hall/leagues/:id (any status, password-confirmed) + delete-preview
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROUND ROBIN TOURNAMENT ENDPOINTS
@@ -3031,25 +3032,10 @@ app.put('/hall/leagues/:id', requireAuth, requireHallAdmin, async (req, res) => 
 });
 
 // ── DELETE /hall/leagues/:id ──────────────────────────────────────────────────
-// Hard delete — only permitted on draft leagues (not active/completed/archived).
-app.delete('/hall/leagues/:id', requireAuth, requireHallAdmin, async (req, res) => {
-  const { id } = req.params;
-  try {
-    const check = await pool.query(
-      `SELECT id, name, status FROM leagues WHERE id = $1 AND poolhall_id = $2`,
-      [id, req.hallId]
-    );
-    if (check.rows.length === 0) return res.status(404).json({ error: 'League not found' });
-    if (check.rows[0].status !== 'draft') {
-      return res.status(409).json({ error: 'Only draft leagues can be deleted' });
-    }
-    await pool.query(`DELETE FROM leagues WHERE id = $1`, [id]);
-    console.log(`[LEAGUE DELETE] id=${id} name="${check.rows[0].name}" poolhall_id=${req.hallId} deleted_by=user_id:${req.user.user_id}`);
-    res.json({ deleted: true, id: parseInt(id), name: check.rows[0].name });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// MOVED 2026-10-12 to routes/league-admin.js (mounted next to the chip routes near the top of the route list).
+// It is no longer draft-only: any status can be deleted after the user re-enters their password, and the
+// deletion is written to event_audit_log. The old draft-only handler was removed from here on purpose —
+// do not re-add it, or whichever is registered first would silently win.
 
 // ── GET /hall/leagues/:id/teams ───────────────────────────────────────────────
 // List teams for a league, with current roster player count.
