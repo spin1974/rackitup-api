@@ -4943,7 +4943,11 @@ app.get('/hall/tryleague-tag-standings', requireAuth, requireHallAuth, async (re
 
 // ── PUT /public/tryleague-sessions/:id/finish ─────────────────────────────────
 // No JWT required. PIN in request body acts as auth.
-// Validates all non-rotate matches are done, then marks session finished and upserts stats.
+// Validates ALL matches (rotate included) are done, then marks session finished and upserts stats.
+// 2026-10-15 fix: rotate matches used to be skipped here, so a session could auto-finish with a
+// rotate still unscored — which then locked the PIN score route (session no longer 'running') and
+// left the rotate out of lifetime stats. Rotate matches are real scored matches (the non-double
+// player gets W/L + points), so they must gate the finish too.
 // Idempotent: if already finished returns 200 with no side-effects.
 app.put('/public/tryleague-sessions/:id/finish', async (req, res) => {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
@@ -4973,10 +4977,10 @@ app.put('/public/tryleague-sessions/:id/finish', async (req, res) => {
     if (!storedPin) return res.status(403).json({ error: 'No PIN set for this session' });
     if (String(pin).trim() !== String(storedPin).trim()) return res.status(403).json({ error: 'Incorrect PIN' });
 
-    // Verify all non-rotate matches are done
+    // Verify all matches (rotate included) are done
     const pendingCheck = await pool.query(
       `SELECT COUNT(*) AS cnt FROM tryleague_matches
-       WHERE session_id = $1 AND is_rotate = FALSE AND status != 'done'`,
+       WHERE session_id = $1 AND status != 'done'`,
       [id]
     );
     if (parseInt(pendingCheck.rows[0].cnt) > 0) {
