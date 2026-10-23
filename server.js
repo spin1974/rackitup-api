@@ -2663,7 +2663,7 @@ app.get('/hall/roundrobin-tag-standings', requireAuth, requireHallAuth, async (r
       if (!agg.has(id)) {
         agg.set(id, {
           first_name: '', last_name: '', hall_rating: null,
-          wins: 0, losses: 0, byes: 0, ball_points: 0, handicap_bonus: 0,
+          wins: 0, losses: 0, byes: 0, ball_points: 0, handicap_bonus: 0, games_scored: 0,
           tournamentIds: new Set(), tagIds: new Set(), tags: []
         });
       }
@@ -2710,6 +2710,7 @@ app.get('/hall/roundrobin-tag-standings', requireAuth, requireHallAuth, async (r
           a.losses         += p.losses;
           a.byes           += p.byes;
           a.ball_points    += p.ball_points;
+          a.games_scored   += p.games_scored;
           a.handicap_bonus += p.handicap_bonus;
           a.tournamentIds.add(tournamentId);
           for (const t of groupTagList) {
@@ -2736,6 +2737,10 @@ app.get('/hall/roundrobin-tag-standings', requireAuth, requireHallAuth, async (r
         losses: a.losses,
         byes: a.byes,
         ball_points: a.ball_points,
+        // games_scored (2026-10-23): powers halladmin/standings.html's Avg Balls
+        // column (ball_points / games_scored). Same per-game count the single-
+        // tournament function keeps - non-scoring make-up p2 excluded.
+        games_scored: a.games_scored,
         handicap_bonus,
         total_points,
         tags: a.tags.sort((x, y) => x.name.localeCompare(y.name))
