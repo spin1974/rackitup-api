@@ -5093,8 +5093,33 @@ app.get('/public/poolhalls/:publicId/rr-player-stats', async (req, res) => {
 
     const { poolhall_id, poolhall_name } = hallResult.rows[0];
 
+    // games_scored / avg_balls (2026-10-23): computed LIVE from the game rows of
+    // this hall's finished tournaments, not from roundrobin_player_stats. That
+    // cache has no game count, and deleting a finished tournament never
+    // subtracts from it, so cached balls / live games could drift. Both halves of
+    // the average come from the same rows here. Counting rules match
+    // computeRoundRobinStandings(): byes and pending rows excluded, and on a
+    // make-up row only p1 (the bye player) scores.
     const result = await pool.query(
-      `SELECT
+      `WITH g AS (
+         SELECT x.player_id, COUNT(*)::int AS games_scored, SUM(x.balls)::numeric AS balls_scored
+           FROM (
+             SELECT m.p1_id AS player_id, COALESCE(m.score1, 0) AS balls
+               FROM roundrobin_matches m
+               JOIN roundrobin_tournaments t ON t.tournament_id = m.tournament_id
+              WHERE t.poolhall_id = $1 AND t.status = 'finished'
+                AND NOT COALESCE(m.is_bye, false) AND m.status <> 'pending'
+             UNION ALL
+             SELECT m.p2_id AS player_id, COALESCE(m.score2, 0) AS balls
+               FROM roundrobin_matches m
+               JOIN roundrobin_tournaments t ON t.tournament_id = m.tournament_id
+              WHERE t.poolhall_id = $1 AND t.status = 'finished'
+                AND NOT COALESCE(m.is_bye, false) AND m.status <> 'pending'
+                AND m.p2_id IS NOT NULL AND NOT COALESCE(m.is_makeup, false)
+           ) x
+          GROUP BY x.player_id
+       )
+       SELECT
          p.player_id,
          p.first_name,
          p.last_name,
@@ -5105,10 +5130,13 @@ app.get('/public/poolhalls/:publicId/rr-player-stats', async (req, res) => {
          COALESCE(s.losses,      0)  AS total_losses,
          COALESCE(s.ball_points, 0)  AS total_ball_points,
          ROUND((COALESCE(s.wins,0) + COALESCE(s.handicap_points,0))::numeric, 2) AS total_points,
+         COALESCE(g.games_scored, 0) AS games_scored,
+         CASE WHEN g.games_scored > 0 THEN ROUND(g.balls_scored / g.games_scored, 2) END AS avg_balls,
          s.last_played_at
        FROM player p
        LEFT JOIN roundrobin_player_stats s
          ON s.player_id = p.player_id AND s.poolhall_id = $1
+       LEFT JOIN g ON g.player_id = p.player_id
        WHERE p.poolhall_id = $1
          AND p.deleted_at IS NULL
          AND s.player_id IS NOT NULL
@@ -5235,7 +5263,7 @@ app.get('/public/poolhalls/:publicId/rr-tag-stats', async (req, res) => {
       if (!agg.has(id)) {
         agg.set(id, {
           first_name: '', last_name: '', hall_rating: null,
-          wins: 0, losses: 0, byes: 0, ball_points: 0, handicap_bonus: 0,
+          wins: 0, losses: 0, byes: 0, ball_points: 0, handicap_bonus: 0, games_scored: 0,
           tournamentIds: new Set(), tagIds: new Set(), tags: []
         });
       }
@@ -5282,6 +5310,7 @@ app.get('/public/poolhalls/:publicId/rr-tag-stats', async (req, res) => {
           a.losses         += p.losses;
           a.byes           += p.byes;
           a.ball_points    += p.ball_points;
+          a.games_scored   += p.games_scored;
           a.handicap_bonus += p.handicap_bonus;
           a.tournamentIds.add(tournamentId);
           for (const t of groupTagList) {
@@ -5308,6 +5337,7 @@ app.get('/public/poolhalls/:publicId/rr-tag-stats', async (req, res) => {
         losses: a.losses,
         byes: a.byes,
         ball_points: a.ball_points,
+        games_scored: a.games_scored, // 2026-10-23: for reports/rr-players.html Avg Balls
         handicap_bonus,
         total_points,
         tags: a.tags.sort((x, y) => x.name.localeCompare(y.name))
