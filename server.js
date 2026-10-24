@@ -978,6 +978,7 @@ app.put('/hall/event-tags/:id', requireAuth, requireHallAdmin, async (req, res) 
 // Chip Tournament routes (hall admin + public) live in routes/chip.js (extracted 2026-10-10).
 app.use(require('./routes/chip'));
 app.use(require('./routes/league-admin'));   // 2026-10-12 — DELETE /hall/leagues/:id (any status, password-confirmed) + delete-preview
+app.use(require('./routes/digitalpool'));     // 2026-10-23 — read-only proxy for DigitalPool.com public tournament data (hall TV board)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROUND ROBIN TOURNAMENT ENDPOINTS
