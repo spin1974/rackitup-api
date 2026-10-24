@@ -125,4 +125,83 @@ router.options('/public/digitalpool/bracket', (req, res) => {
   res.sendStatus(204);
 });
 
+// ── Tournament search ─────────────────────────────────────────────────────────
+// Replays digitalpool.com's own SearchTournaments3WithStatus query verbatim (so it
+// keeps working even if the upstream whitelists query strings). Matches on
+// tournament name OR venue name/city/region, public tournaments only. Status
+// defaults to IN_PROGRESS — the live-event case a hall TV wants — and is
+// overridable via ?status=IN_PROGRESS,COMPLETED (values are DigitalPool's own
+// tournament_status_enum; unknown values would be rejected upstream).
+const SEARCH_QUERY = `query SearchTournaments3WithStatus($name: String = "%%", $limit: Int = 10, $offset: Int = 0, $game_type: String = "%", $status: [tournament_status_enum!]) {
+  tournaments_aggregate(where: {_and: [{is_public: {_eq: true}}, {game_type: {_ilike: $game_type}}, {status: {_in: $status}}, {_or: [{name: {_ilike: $name}}, {venue: {name: {_ilike: $name}}}, {venue: {city: {_ilike: $name}}}, {venue: {region: {_ilike: $name}}}]}]}) {
+    aggregate { count __typename } __typename
+  }
+  tournaments(where: {_and: [{is_public: {_eq: true}}, {game_type: {_ilike: $game_type}}, {status: {_in: $status}}, {_or: [{name: {_ilike: $name}}, {venue: {name: {_ilike: $name}}}, {venue: {city: {_ilike: $name}}}, {venue: {region: {_ilike: $name}}}]}]}, limit: $limit, offset: $offset, order_by: [{is_featured: desc_nulls_last}, {start_date_time: desc}]) {
+    id name slug status progress start_date_time flyer game_type tournament_type tournament_format
+    winners_race_to losers_race_to is_featured is_public
+    tournament_players_aggregate { aggregate { count __typename } __typename }
+    tournament_brackets_aggregate { aggregate { count __typename } __typename }
+    venue { id name slug city country region __typename }
+    __typename
+  }
+}`;
+
+const searchCache = new Map(); // key -> { at, payload }
+
+router.get('/public/digitalpool/search', async (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Cache-Control', 'no-store');
+
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) return res.status(400).json({ error: 'q must be at least 2 characters' });
+
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
+  const status = String(req.query.status || 'IN_PROGRESS')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const name = '%' + q + '%';
+
+  const key = status.join(',') + '|' + limit + '|' + name.toLowerCase();
+  const now = Date.now();
+  const hit = searchCache.get(key);
+  if (hit && now - hit.at < 15000) return res.json({ ...hit.payload, cached: true });
+
+  try {
+    const r = await fetch(UPSTREAM, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'origin': 'https://digitalpool.com',
+        'x-client-environment': 'prod',
+        'user-agent': 'RackItUp-DigitalPool-Board/1.0 (+https://rackit-up.com)'
+      },
+      body: JSON.stringify({
+        operationName: 'SearchTournaments3WithStatus',
+        variables: { name, limit, offset: 0, game_type: '%', status },
+        query: SEARCH_QUERY
+      }),
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)
+    });
+    if (!r.ok) { const e = new Error('Upstream ' + r.status); e.status = 502; throw e; }
+    const json = await r.json();
+    if (json.errors) { const e = new Error('Upstream GraphQL error: ' + JSON.stringify(json.errors).slice(0, 300)); e.status = 502; throw e; }
+    const data = json.data || {};
+    const payload = {
+      fetchedAt: new Date().toISOString(),
+      q,
+      count: (data.tournaments_aggregate && data.tournaments_aggregate.aggregate && data.tournaments_aggregate.aggregate.count) || 0,
+      tournaments: data.tournaments || []
+    };
+    searchCache.set(key, { at: now, payload });
+    return res.json({ ...payload, cached: false });
+  } catch (err) {
+    return res.status(err.status || 502).json({ error: err.message || 'Upstream search failed' });
+  }
+});
+
+router.options('/public/digitalpool/search', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.sendStatus(204);
+});
+
 module.exports = router;
