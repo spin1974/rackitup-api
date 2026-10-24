@@ -53,37 +53,79 @@ const BRACKET_QUERY = `query GetPublicTournamentBracket($tournamentId: Int!) {
 // tournamentId -> { at: epochMs, payload: {...} }
 const cache = new Map();
 
-async function fetchBracket(tournamentId) {
+// Lean metadata query, by tournament id. Enough for the board header (name + venue).
+// Separate, optional call — if it fails the bracket still renders and the board
+// falls back to "Tournament #id", so a metadata hiccup never breaks the board.
+const META_QUERY = `query DpTournamentMeta($tournamentId: Int!) {
+  tournaments(where: {id: {_eq: $tournamentId}}) {
+    id name slug status progress tournament_type game_type
+    venue { name city region country __typename }
+    __typename
+  }
+}`;
+
+const UPSTREAM_HEADERS = {
+  'content-type': 'application/json',
+  'origin': 'https://digitalpool.com',
+  'x-client-environment': 'prod',
+  'user-agent': 'RackItUp-DigitalPool-Board/1.0 (+https://rackit-up.com)'
+};
+
+async function gql(operationName, variables, query) {
   const res = await fetch(UPSTREAM, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      // Mimic the real client so the upstream proxy treats us like the site.
-      'origin': 'https://digitalpool.com',
-      'x-client-environment': 'prod',
-      'user-agent': 'RackItUp-DigitalPool-Board/1.0 (+https://rackit-up.com)'
-    },
-    body: JSON.stringify({
-      operationName: 'GetPublicTournamentBracket',
-      variables: { tournamentId },
-      query: BRACKET_QUERY
-    }),
+    headers: UPSTREAM_HEADERS,
+    body: JSON.stringify({ operationName, variables, query }),
     signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)
   });
-
-  if (!res.ok) {
-    const e = new Error(`Upstream ${res.status}`);
-    e.status = 502;
-    throw e;
-  }
+  if (!res.ok) { const e = new Error('Upstream ' + res.status); e.status = 502; throw e; }
   const json = await res.json();
-  if (json.errors) {
-    const e = new Error('Upstream GraphQL error: ' + JSON.stringify(json.errors).slice(0, 300));
-    e.status = 502;
-    throw e;
+  if (json.errors) { const e = new Error('Upstream GraphQL error: ' + JSON.stringify(json.errors).slice(0, 300)); e.status = 502; throw e; }
+  return json.data || {};
+}
+
+// Build the board's header subtitle from the match rows + (optional) venue.
+function buildSubtitle(matches, venue) {
+  const players = new Set();
+  let hasLosers = false;
+  for (const m of matches) {
+    if (m.round < 0) hasLosers = true;
+    for (const side of ['challenger1', 'challenger2']) {
+      const id = m[side + '_id'], name = m[side + '_name'];
+      if (id && name && name !== 'BYE') players.add(id);
+    }
   }
-  const matches = (json.data && json.data.tournament_brackets) || [];
-  return { fetchedAt: new Date().toISOString(), tournament_id: tournamentId, tournament_brackets: matches };
+  const bits = [];
+  if (venue) {
+    const where = [venue.name, venue.city].filter(Boolean).join(', ');
+    if (where) bits.push(where);
+  }
+  bits.push(players.size + ' players');
+  bits.push((hasLosers ? 'double' : 'single') + ' elimination');
+  return bits.join(' · ');
+}
+
+async function fetchBracket(tournamentId) {
+  // Bracket is required; metadata is best-effort (name/venue for the header).
+  const [bracketData, metaData] = await Promise.all([
+    gql('GetPublicTournamentBracket', { tournamentId }, BRACKET_QUERY),
+    gql('DpTournamentMeta', { tournamentId }, META_QUERY).catch(() => null)
+  ]);
+
+  const matches = bracketData.tournament_brackets || [];
+  const meta = metaData && metaData.tournaments && metaData.tournaments[0];
+
+  const payload = {
+    fetchedAt: new Date().toISOString(),
+    tournament_id: tournamentId,
+    tournament_brackets: matches
+  };
+  if (meta) {
+    payload.tournament_name = meta.name;
+    payload.tournament_slug = meta.slug;
+    payload.tournament_sub  = buildSubtitle(matches, meta.venue);
+  }
+  return payload;
 }
 
 // GET /public/digitalpool/bracket?tournamentId=168134
